@@ -1,3 +1,7 @@
+# torch is installed separately in Dockerfile with the correct CUDA wheel --
+# listing it here with no version constraint prevents pyannote from reinstalling it from PyPI
+torch
+torchaudio
 fastapi>=0.110.0
 uvicorn>=0.27.0
 python-multipart>=0.0.9

@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -12,7 +12,7 @@ WORKDIR /app
 # Install PyTorch with CUDA 12.1 before other deps
 RUN pip3 install --no-cache-dir \
     torch torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
+    --index-url https://download.pytorch.org/whl/cu126
 
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
