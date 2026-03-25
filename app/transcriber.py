@@ -40,12 +40,14 @@ class Transcriber:
         log.info("Loading faster-whisper model: %s", model_size)
         import ctranslate2
         if ctranslate2.get_cuda_device_count() > 0:
-            device, compute_type = "cuda", "float16"
-            log.info("GPU detected — using CUDA float16")
-        else:
-            device, compute_type = "cpu", "int8"
-            log.warning("No GPU detected — falling back to CPU int8 (slower)")
-        self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            try:
+                self._model = WhisperModel(model_size, device="cuda", compute_type="float16")
+                log.info("faster-whisper loaded on GPU (float16).")
+                return
+            except Exception as e:
+                log.warning("GPU init failed (%s) — falling back to CPU int8", e)
+        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        log.warning("faster-whisper running on CPU int8 — transcription will be slow.")
         log.info("faster-whisper ready.")
 
     def transcribe(self, audio_path: str) -> List[Dict]:
