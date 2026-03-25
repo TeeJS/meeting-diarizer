@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>meeting-diarizer</Name>
+  <Repository>ghcr.io/teejs/meeting-diarizer:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Overview>Speaker-diarized transcription service combining faster-whisper and pyannote. GPU required.</Overview>
+  <Category>MediaApp:</Category>
+  <WebUI>http://[IP]:[PORT:10301]/health</WebUI>
+  <ExtraParams>--gpus all</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>NVIDIA GPU with CUDA 12.x support</Requires>
+
+  <Config Name="Port" Target="10301" Default="10301" Mode="tcp"
+          Description="API port" Type="Port" Display="always" Required="true" Mask="false">10301</Config>
+
+  <Config Name="Data Path" Target="/data" Default="/mnt/user/appdata/meeting-diarizer"
+          Description="Stores model cache and speaker enrollment embeddings" Type="Path"
+          Display="always" Required="true" Mask="false">/mnt/user/appdata/meeting-diarizer</Config>
+
+  <Config Name="HF_TOKEN" Target="HF_TOKEN" Default=""
+          Description="HuggingFace access token — required to download pyannote models"
+          Type="Variable" Display="always" Required="true" Mask="true"/>
+
+  <Config Name="WHISPER_MODEL" Target="WHISPER_MODEL" Default="large-v3"
+          Description="Whisper model size: tiny / base / small / medium / large-v3"
+          Type="Variable" Display="advanced" Required="false" Mask="false">large-v3</Config>
+
+  <Config Name="DATA_DIR" Target="DATA_DIR" Default="/data"
+          Description="Internal container data path — do not change"
+          Type="Variable" Display="advanced" Required="false" Mask="false">/data</Config>
+</Container>
