@@ -38,7 +38,14 @@ def _ensure_16k_mono(path: str) -> tuple:
 class Transcriber:
     def __init__(self, model_size: str = "large-v3"):
         log.info("Loading faster-whisper model: %s", model_size)
-        self._model = WhisperModel(model_size, device="cuda", compute_type="float16")
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            device, compute_type = "cuda", "float16"
+            log.info("GPU detected — using CUDA float16")
+        else:
+            device, compute_type = "cpu", "int8"
+            log.warning("No GPU detected — falling back to CPU int8 (slower)")
+        self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
         log.info("faster-whisper ready.")
 
     def transcribe(self, audio_path: str) -> List[Dict]:
