@@ -130,9 +130,11 @@ class Diarizer:
         Run diarization, align with word timestamps, identify speakers,
         and return grouped segments.
         """
-        audio       = _load_audio(audio_path)
-        annotation  = self._pipeline(audio)
-        timeline    = [
+        audio      = _load_audio(audio_path)
+        result     = self._pipeline(audio)
+        # pyannote 3.3+ returns DiarizeOutput; older versions return Annotation directly
+        annotation = result.annotation if hasattr(result, "annotation") else result
+        timeline   = [
             (turn.start, turn.end, spk)
             for turn, _, spk in annotation.itertracks(yield_label=True)
         ]
