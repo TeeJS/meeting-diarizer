@@ -5,6 +5,8 @@ Pyannote speaker diarization + enrolled speaker identification.
 import logging
 import numpy as np
 import torch
+import torchaudio
+import torchaudio.transforms as T
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -18,6 +20,27 @@ log = logging.getLogger(__name__)
 SIMILARITY_THRESHOLD = 0.75
 EMBEDDING_MODEL      = "pyannote/wespeaker-voxceleb-resnet34-LM"
 _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+PYANNOTE_SR = 16000  # sample rate pyannote models expect
+
+
+def _load_audio(path: str) -> dict:
+    """Load audio file as a pyannote-compatible waveform dict, bypassing torchcodec."""
+    waveform, sr = torchaudio.load(path, backend="soundfile")
+    if sr != PYANNOTE_SR:
+        waveform = T.Resample(orig_freq=sr, new_freq=PYANNOTE_SR)(waveform)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    return {"waveform": waveform, "sample_rate": PYANNOTE_SR}
+
+
+def _crop_audio(audio: dict, start: float, end: float) -> dict:
+    """Crop a waveform dict to the given time range (seconds)."""
+    sr = audio["sample_rate"]
+    s  = int(start * sr)
+    e  = int(end   * sr)
+    return {"waveform": audio["waveform"][:, s:e], "sample_rate": sr}
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -84,7 +107,8 @@ class Diarizer:
 
     def enroll_speaker(self, name: str, audio_path: str):
         """Extract and store a speaker embedding from a reference audio file."""
-        embedding = self._inference(audio_path)
+        audio     = _load_audio(audio_path)
+        embedding = self._inference(audio)
         self._store.save(name, np.array(embedding))
         log.info("Enrolled speaker: %s", name)
 
@@ -102,7 +126,8 @@ class Diarizer:
         Run diarization, align with word timestamps, identify speakers,
         and return grouped segments.
         """
-        annotation  = self._pipeline(audio_path)
+        audio       = _load_audio(audio_path)
+        annotation  = self._pipeline(audio)
         timeline    = [
             (turn.start, turn.end, spk)
             for turn, _, spk in annotation.itertracks(yield_label=True)
@@ -131,7 +156,8 @@ class Diarizer:
                 embeddings = []
                 for seg in speaker_segs[:10]:  # cap for speed
                     try:
-                        emb = self._inference({"audio": audio_path}, excerpt=seg)
+                        cropped = _crop_audio(audio, seg.start, seg.end)
+                        emb     = self._inference(cropped)
                         embeddings.append(np.array(emb))
                     except Exception:
                         continue
