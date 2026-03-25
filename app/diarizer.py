@@ -133,7 +133,7 @@ class Diarizer:
         audio      = _load_audio(audio_path)
         result     = self._pipeline(audio)
         # pyannote 3.3+ returns DiarizeOutput; older versions return Annotation directly
-        annotation = result.annotation if hasattr(result, "annotation") else result
+        annotation = result.speaker_diarization if hasattr(result, "speaker_diarization") else result
         timeline   = [
             (turn.start, turn.end, spk)
             for turn, _, spk in annotation.itertracks(yield_label=True)
