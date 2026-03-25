@@ -4,9 +4,8 @@ Pyannote speaker diarization + enrolled speaker identification.
 
 import logging
 import numpy as np
+import soundfile as sf
 import torch
-import torchaudio
-import torchaudio.transforms as T
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -26,12 +25,17 @@ PYANNOTE_SR = 16000  # sample rate pyannote models expect
 
 
 def _load_audio(path: str) -> dict:
-    """Load audio file as a pyannote-compatible waveform dict, bypassing torchcodec."""
-    waveform, sr = torchaudio.load(path, backend="soundfile")
-    if sr != PYANNOTE_SR:
-        waveform = T.Resample(orig_freq=sr, new_freq=PYANNOTE_SR)(waveform)
-    if waveform.shape[0] > 1:
+    """Load audio file as a pyannote-compatible waveform dict using soundfile only."""
+    data, sr = sf.read(path, dtype="float32", always_2d=True)
+    waveform = torch.from_numpy(data.T)          # (channels, samples)
+    if waveform.shape[0] > 1:                    # mix down to mono
         waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != PYANNOTE_SR:                        # resample if needed
+        orig_len  = waveform.shape[1]
+        new_len   = int(orig_len * PYANNOTE_SR / sr)
+        waveform  = torch.nn.functional.interpolate(
+            waveform.unsqueeze(0), size=new_len, mode="linear", align_corners=False
+        ).squeeze(0)
     return {"waveform": waveform, "sample_rate": PYANNOTE_SR}
 
 

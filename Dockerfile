@@ -15,7 +15,8 @@ RUN pip3 install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu126
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt && \
+    pip3 uninstall -y torchcodec || true
 
 COPY app/ ./app/
 
