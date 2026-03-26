@@ -41,8 +41,8 @@ class Transcriber:
         import ctranslate2
         if ctranslate2.get_cuda_device_count() > 0:
             try:
-                self._model = WhisperModel(model_size, device="cuda", compute_type="float16")
-                log.info("faster-whisper loaded on GPU (float16).")
+                self._model = WhisperModel(model_size, device="cuda", compute_type="auto")
+                log.info("faster-whisper loaded on GPU (auto compute type).")
                 return
             except Exception as e:
                 log.warning("GPU init failed (%s) — falling back to CPU int8", e)
