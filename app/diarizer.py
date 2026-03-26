@@ -118,6 +118,9 @@ class Diarizer:
 
     def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD) -> Optional[str]:
         """Compare embedding to enrolled speakers. Returns name or None."""
+        if np.any(np.isnan(embedding)):
+            log.warning("Skipping segment: NaN embedding (segment too short or degenerate)")
+            return None
         best_name, best_score = None, -1.0
         scores = {}
         for name, enrolled in self._store.all_embeddings().items():
@@ -171,9 +174,15 @@ class Diarizer:
                 embeddings = []
                 for seg in speaker_segs[:10]:  # cap for speed
                     try:
+                        if seg.end - seg.start < 0.5:  # skip segments too short to embed reliably
+                            continue
                         cropped = _crop_audio(audio, seg.start, seg.end)
-                        emb     = self._inference(cropped)
-                        embeddings.append(np.array(emb))
+                        emb     = np.array(self._inference(cropped))
+                        if np.any(np.isnan(emb)):
+                            log.warning("Skipping %.2fs segment [%.2f-%.2f]: NaN embedding",
+                                        seg.end - seg.start, seg.start, seg.end)
+                            continue
+                        embeddings.append(emb)
                     except Exception:
                         continue
 
