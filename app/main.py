@@ -57,10 +57,11 @@ async def health():
 
 
 @app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
+async def transcribe(audio: UploadFile = File(...), threshold: float = Form(0.75)):
     """
     Transcribe an audio file with speaker diarization.
     Returns a list of speaker-labeled segments.
+    Optional: threshold (float, default 0.75) — speaker identification confidence cutoff.
     """
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -68,8 +69,9 @@ async def transcribe(audio: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
+        log.info("Transcribe request — threshold=%.2f", threshold)
         words    = _transcriber.transcribe(tmp_path)
-        segments = _diarizer.diarize(tmp_path, words)
+        segments = _diarizer.diarize(tmp_path, words, threshold=threshold)
         return JSONResponse({"segments": segments})
     except Exception as e:
         log.exception("Transcription/diarization failed")

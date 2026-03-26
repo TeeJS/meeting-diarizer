@@ -116,16 +116,25 @@ class Diarizer:
         self._store.save(name, np.array(embedding))
         log.info("Enrolled speaker: %s", name)
 
-    def _identify(self, embedding: np.ndarray) -> Optional[str]:
+    def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD) -> Optional[str]:
         """Compare embedding to enrolled speakers. Returns name or None."""
         best_name, best_score = None, -1.0
+        scores = {}
         for name, enrolled in self._store.all_embeddings().items():
             score = _cosine_similarity(embedding, enrolled)
+            scores[name] = round(score, 4)
             if score > best_score:
                 best_name, best_score = name, score
-        return best_name if best_score >= SIMILARITY_THRESHOLD else None
+        log.info("Speaker similarity scores (threshold=%.2f): %s", threshold,
+                 ", ".join(f"{n}={s}" for n, s in sorted(scores.items(), key=lambda x: -x[1])))
+        if best_score >= threshold:
+            log.info("  → Matched: %s (%.4f)", best_name, best_score)
+            return best_name
+        else:
+            log.info("  → No match (best was %s at %.4f)", best_name, best_score)
+            return None
 
-    def diarize(self, audio_path: str, words: List[Dict]) -> List[Dict]:
+    def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD) -> List[Dict]:
         """
         Run diarization, align with word timestamps, identify speakers,
         and return grouped segments.
@@ -170,7 +179,7 @@ class Diarizer:
 
                 if embeddings:
                     avg_emb = np.mean(embeddings, axis=0)
-                    name    = self._identify(avg_emb)
+                    name    = self._identify(avg_emb, threshold=threshold)
                     if name:
                         label_map[pyannote_label] = name
                         log.info("Identified %s as: %s", pyannote_label, name)
