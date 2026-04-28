@@ -104,6 +104,7 @@ class Diarizer:
 
         log.info("Loading speaker embedding model: %s", EMBEDDING_MODEL)
         emb_model = Model.from_pretrained(EMBEDDING_MODEL, token=hf_token)
+        emb_model = emb_model.to(torch.device("cuda"))
         self._inference = Inference(emb_model, window="whole")
 
         self._store = enrollment_store
