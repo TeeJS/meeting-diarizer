@@ -6,7 +6,7 @@
   <Network>bridge</Network>
   <Privileged>false</Privileged>
   <Support/>
-  <Overview>Speaker-diarized transcription service combining faster-whisper and pyannote. GPU required.</Overview>
+  <Overview>Speaker-diarized transcription. Pyannote diarizes (GPU, lazy-loaded, idle-released); transcription is delegated to a remote wyoming-faster-whisper instance over TCP. Requires a Wyoming Whisper server reachable on the network — by default the one at 192.168.1.25:10300.</Overview>
   <Category>MediaApp:</Category>
   <WebUI>http://[IP]:[PORT:10301]/health</WebUI>
   <ExtraParams>--gpus all</ExtraParams>
@@ -28,9 +28,29 @@
           Description="HuggingFace access token — required to download pyannote models"
           Type="Variable" Display="always" Required="true" Mask="true"/>
 
-  <Config Name="WHISPER_MODEL" Target="WHISPER_MODEL" Default="large-v3"
-          Description="Whisper model size: tiny / base / small / medium / large-v3"
-          Type="Variable" Display="advanced" Required="false" Mask="false">large-v3</Config>
+  <Config Name="WYOMING_HOST" Target="WYOMING_HOST" Default="192.168.1.25"
+          Description="Hostname or IP of the wyoming-faster-whisper server."
+          Type="Variable" Display="always" Required="true" Mask="false">192.168.1.25</Config>
+
+  <Config Name="WYOMING_PORT" Target="WYOMING_PORT" Default="10300"
+          Description="TCP port of the wyoming-faster-whisper server."
+          Type="Variable" Display="always" Required="true" Mask="false">10300</Config>
+
+  <Config Name="WYOMING_LANGUAGE" Target="WYOMING_LANGUAGE" Default="en"
+          Description="Language code passed to Wyoming on each transcribe request."
+          Type="Variable" Display="advanced" Required="false" Mask="false">en</Config>
+
+  <Config Name="WHISPER_MODELS" Target="WHISPER_MODELS" Default=""
+          Description="Optional named backends for A/B testing different Whisper model sizes. Format: 'medium:10300,large:10302' (hosts inherit WYOMING_HOST) or 'medium=host:port,large=host:port'. When set, requests to /transcribe accept a `model` form field."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="WHISPER_DEFAULT" Target="WHISPER_DEFAULT" Default=""
+          Description="Name of the WHISPER_MODELS entry to use when a request omits the `model` field. Leave blank to fall back to WYOMING_HOST/WYOMING_PORT."
+          Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="IDLE_RELEASE_SECONDS" Target="IDLE_RELEASE_SECONDS" Default="300"
+          Description="Seconds of inactivity after which the pyannote models are released from GPU. Set higher if you do bursts of requests; lower to free VRAM sooner."
+          Type="Variable" Display="advanced" Required="false" Mask="false">300</Config>
 
   <Config Name="DATA_DIR" Target="DATA_DIR" Default="/data"
           Description="Internal container data path — do not change"

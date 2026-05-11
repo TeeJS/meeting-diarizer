@@ -3,3 +3,6 @@ __pycache__/
 *.egg-info/
 .env
 *.log
+
+# Claude Code session state — never commit
+.claude/
