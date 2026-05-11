@@ -9,13 +9,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install PyTorch with CUDA 12.1 before other deps
-RUN pip3 install --no-cache-dir \
+# Install PyTorch with the matching CUDA wheel before other deps.
+# The torch + nvidia-* wheels are 2-3 GB total and the nvidia mirror can
+# be slow, so bump pip's default 60s timeout and add retries to keep the
+# build from failing on transient read stalls.
+RUN pip3 install --no-cache-dir --default-timeout=300 --retries=5 \
     torch torchaudio \
     --index-url https://download.pytorch.org/whl/cu126
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt && \
+RUN pip3 install --no-cache-dir --default-timeout=300 --retries=5 -r requirements.txt && \
     pip3 uninstall -y torchcodec || true
 
 COPY app/ ./app/
