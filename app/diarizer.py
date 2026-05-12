@@ -116,25 +116,6 @@ def _default_label(pyannote_label: str, index_map: dict) -> str:
     return f"Speaker {_LABELS[idx]}" if idx < len(_LABELS) else pyannote_label
 
 
-def _from_pretrained_compat(loader, checkpoint: str, hf_token: str):
-    """Call pyannote's `from_pretrained` with whichever auth kwarg works.
-
-    The kwarg was renamed across the pyannote 3.x line:
-      - pyannote.audio 3.1.x:   use_auth_token=<token>
-      - pyannote.audio 3.3.x+:  token=<token>
-
-    Rather than pin a narrow pyannote version (which can fight torch
-    constraints during pip resolution), try the newer name first and
-    fall back to the older one on TypeError.
-    """
-    try:
-        return loader(checkpoint, token=hf_token)
-    except TypeError as e:
-        if "token" in str(e):
-            return loader(checkpoint, use_auth_token=hf_token)
-        raise
-
-
 class Diarizer:
     """Speaker diarization + identification, driving Wyoming transcription.
 
@@ -158,17 +139,14 @@ class Diarizer:
             return
 
         log.info("Loading pyannote speaker-diarization-3.1 ...")
-        self._pipeline = _from_pretrained_compat(
-            Pipeline.from_pretrained,
+        self._pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            self._hf_token,
+            token=self._hf_token,
         )
         self._pipeline.to(torch.device("cuda"))
 
         log.info("Loading speaker embedding model: %s", EMBEDDING_MODEL)
-        emb_model = _from_pretrained_compat(
-            Model.from_pretrained, EMBEDDING_MODEL, self._hf_token,
-        )
+        emb_model = Model.from_pretrained(EMBEDDING_MODEL, token=self._hf_token)
         emb_model = emb_model.to(torch.device("cuda"))
         self._inference = Inference(emb_model, window="whole")
 
