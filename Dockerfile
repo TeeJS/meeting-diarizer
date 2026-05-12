@@ -14,12 +14,16 @@ WORKDIR /app
 # be slow, so bump pip's default 60s timeout and add retries to keep the
 # build from failing on transient read stalls.
 #
-# torch<2.10 cap: torchaudio 2.10+ removed torchaudio.AudioMetaData, but
-# pyannote.audio 3.x still references it (their migration to the new API
-# only landed in pyannote 4.0). Until we move to pyannote 4.x (blocked
-# by an open VRAM regression — see requirements.txt), stay on torch 2.9.x.
+# torch<2.9 cap: torchaudio 2.9.0 fully REMOVED torchaudio.AudioMetaData
+# (it was deprecated-with-shim in 2.8 then dropped in 2.9). Pyannote 3.x
+# still references AudioMetaData directly as a return-type annotation in
+# pyannote/audio/core/io.py, so the import explodes on torchaudio 2.9+.
+# Pyannote only migrated to the new API in 4.0, which we have pinned out
+# in requirements.txt because of the open 4.0.3 VRAM regression.
+# Land on torchaudio 2.8.x: still has AudioMetaData (with a deprecation
+# warning, harmless), and pyannote 3.x is happy.
 RUN pip3 install --no-cache-dir --default-timeout=300 --retries=5 \
-    "torch<2.10" "torchaudio<2.10" \
+    "torch<2.9" "torchaudio<2.9" \
     --index-url https://download.pytorch.org/whl/cu126
 
 COPY requirements.txt .
