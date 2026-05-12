@@ -256,11 +256,16 @@ async def transcribe(
 
         assert _diarizer_lock is not None
         async with _diarizer_lock:
-            d    = _ensure_diarizer_locked()
+            d = _ensure_diarizer_locked()
+            # Load pyannote models on the main thread. Doing this from a
+            # worker thread segfaults under our pyannote 4.x setup; the
+            # block here is unavoidable but short after the first call
+            # (subsequent calls are no-ops while models stay resident).
+            d.ensure_loaded()
             loop = asyncio.get_running_loop()
-            # diarize() does GPU work AND blocking Wyoming network I/O.
-            # Offload to a thread so the event loop stays responsive for
-            # /health pings; the lock above still serializes GPU work.
+            # diarize() does GPU inference AND blocking Wyoming network
+            # I/O. Offload to a worker thread so the event loop stays
+            # responsive; inference (unlike loading) is thread-safe here.
             segments = await loop.run_in_executor(
                 None, d.diarize, tmp_path, wy, threshold,
             )
@@ -290,7 +295,9 @@ async def enroll(name: str = Form(...), audio: UploadFile = File(...)):
     try:
         assert _diarizer_lock is not None
         async with _diarizer_lock:
-            d    = _ensure_diarizer_locked()
+            d = _ensure_diarizer_locked()
+            # See transcribe() — model load must be on the main thread.
+            d.ensure_loaded()
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, d.enroll_speaker, name, tmp_path)
             global _last_used

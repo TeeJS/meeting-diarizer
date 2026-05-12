@@ -133,8 +133,15 @@ class Diarizer:
     # Model lifecycle
     # ------------------------------------------------------------------
 
-    def _ensure_loaded(self) -> None:
-        """Construct pyannote models on first use. Idempotent."""
+    def ensure_loaded(self) -> None:
+        """Construct pyannote models on first use. Idempotent.
+
+        Important: call this from the asyncio main thread, NOT from a
+        thread-pool executor. Pyannote 4.x's loading path (HuggingFace
+        download + model init) segfaults intermittently when called
+        from a worker thread under our environment. Inference itself
+        (Pipeline.__call__, Inference.__call__) is fine on a worker.
+        """
         if self._pipeline is not None and self._inference is not None:
             return
 
@@ -172,8 +179,11 @@ class Diarizer:
     # ------------------------------------------------------------------
 
     def enroll_speaker(self, name: str, audio_path: str) -> None:
-        """Extract and store a speaker embedding from a reference audio file."""
-        self._ensure_loaded()
+        """Extract and store a speaker embedding from a reference audio file.
+
+        Caller is responsible for having invoked `ensure_loaded()` first
+        (on the asyncio main thread, not a worker).
+        """
         audio     = _load_audio(audio_path)
         embedding = self._inference(audio)
         self._store.save(name, np.array(embedding))
@@ -191,14 +201,15 @@ class Diarizer:
     ) -> List[Dict]:
         """Diarize an audio file and transcribe each speaker turn.
 
+        Caller is responsible for having invoked `ensure_loaded()` first
+        (on the asyncio main thread, not a worker).
+
         Returns segments shaped like:
             [{"speaker": str, "start": float, "end": float, "text": str}, ...]
 
         Empty / sub-MIN_TURN_SECONDS turns are dropped. Turns where
         Wyoming returns empty text are also dropped (silence / non-speech).
         """
-        self._ensure_loaded()
-
         audio  = _load_audio(audio_path)
         result = self._pipeline(audio)
 
