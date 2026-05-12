@@ -13,8 +13,13 @@ WORKDIR /app
 # The torch + nvidia-* wheels are 2-3 GB total and the nvidia mirror can
 # be slow, so bump pip's default 60s timeout and add retries to keep the
 # build from failing on transient read stalls.
+#
+# torch<2.10 cap: torchaudio 2.10+ removed torchaudio.AudioMetaData, but
+# pyannote.audio 3.x still references it (their migration to the new API
+# only landed in pyannote 4.0). Until we move to pyannote 4.x (blocked
+# by an open VRAM regression — see requirements.txt), stay on torch 2.9.x.
 RUN pip3 install --no-cache-dir --default-timeout=300 --retries=5 \
-    torch torchaudio \
+    "torch<2.10" "torchaudio<2.10" \
     --index-url https://download.pytorch.org/whl/cu126
 
 COPY requirements.txt .
