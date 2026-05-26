@@ -3,11 +3,18 @@ Meeting Diarizer — FastAPI service.
 Combines faster-whisper transcription with pyannote speaker diarization.
 """
 
-import logging
 import os
+from pathlib import Path
+
+# Must run BEFORE importing transcriber/diarizer below, which transitively
+# import huggingface_hub and lock in its cache location. setdefault lets an
+# explicit container-level HF_HOME still win.
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+os.environ.setdefault("HF_HOME", str(DATA_DIR / "models"))
+
+import logging
 import tempfile
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -23,7 +30,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DATA_DIR      = Path(os.environ.get("DATA_DIR", "/data"))
 HF_TOKEN      = os.environ.get("HF_TOKEN", "")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 
@@ -35,9 +41,6 @@ _store:       EnrollmentStore = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _transcriber, _diarizer, _store
-
-    # Point HuggingFace cache at our data volume
-    os.environ["HF_HOME"] = str(DATA_DIR / "models")
 
     _store       = EnrollmentStore(DATA_DIR / "enrollments")
     _transcriber = Transcriber(model_size=WHISPER_MODEL)
