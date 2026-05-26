@@ -57,11 +57,11 @@ async def health():
 
 
 @app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...), threshold: float = Form(0.75)):
+async def transcribe(audio: UploadFile = File(...), threshold: float = Form(0.35)):
     """
     Transcribe an audio file with speaker diarization.
     Returns a list of speaker-labeled segments.
-    Optional: threshold (float, default 0.75) — speaker identification confidence cutoff.
+    Optional: threshold (float, default 0.35) — speaker identification confidence cutoff.
     """
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:

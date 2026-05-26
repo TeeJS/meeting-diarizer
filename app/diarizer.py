@@ -16,7 +16,7 @@ from .enrollment import EnrollmentStore
 
 log = logging.getLogger(__name__)
 
-SIMILARITY_THRESHOLD = 0.75
+SIMILARITY_THRESHOLD = 0.35
 EMBEDDING_MODEL      = "pyannote/wespeaker-voxceleb-resnet34-LM"
 _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
