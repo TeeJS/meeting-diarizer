@@ -17,6 +17,7 @@ from .enrollment import EnrollmentStore
 log = logging.getLogger(__name__)
 
 SIMILARITY_THRESHOLD = 0.35
+ATTENDEE_OFFSET      = 0.15  # subtracted from similarity scores of non-attendees
 EMBEDDING_MODEL      = "pyannote/wespeaker-voxceleb-resnet34-LM"
 _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -117,20 +118,41 @@ class Diarizer:
         self._store.save(name, np.array(embedding))
         log.info("Enrolled speaker: %s", name)
 
-    def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD) -> Optional[str]:
-        """Compare embedding to enrolled speakers. Returns name or None."""
+    def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD,
+                  attendees: Optional[set] = None) -> Optional[str]:
+        """Compare embedding to enrolled speakers. Returns name or None.
+
+        If `attendees` is provided, enrolled speakers NOT in that set have
+        ATTENDEE_OFFSET subtracted from their similarity score before ranking.
+        Attendees in the set keep their raw scores.
+        """
         if np.any(np.isnan(embedding)):
             log.warning("Skipping segment: NaN embedding (segment too short or degenerate)")
             return None
         best_name, best_score = None, -1.0
-        scores = {}
+        # display_scores holds the value used for ranking (adjusted if applicable)
+        # so the log line shows the actual comparison the algorithm did.
+        display_scores = {}
+        raw_scores     = {}
         for name, enrolled in self._store.all_embeddings().items():
-            score = _cosine_similarity(embedding, enrolled)
-            scores[name] = round(score, 4)
+            raw = _cosine_similarity(embedding, enrolled)
+            raw_scores[name] = round(raw, 4)
+            if attendees is not None and name not in attendees:
+                adjusted = raw - ATTENDEE_OFFSET
+                display_scores[name] = f"{round(adjusted, 4)} (raw {round(raw, 4)})"
+                score = adjusted
+            else:
+                display_scores[name] = f"{round(raw, 4)}{'*' if attendees is not None else ''}"
+                score = raw
             if score > best_score:
                 best_name, best_score = name, score
-        log.info("Speaker similarity scores (threshold=%.2f): %s", threshold,
-                 ", ".join(f"{n}={s}" for n, s in sorted(scores.items(), key=lambda x: -x[1])))
+        # Sort log output by the adjusted/ranked score, descending — matches actual ranking
+        ranked = sorted(raw_scores.keys(),
+                        key=lambda n: (raw_scores[n] - ATTENDEE_OFFSET) if (attendees is not None and n not in attendees) else raw_scores[n],
+                        reverse=True)
+        legend = " (*=attendee)" if attendees is not None else ""
+        log.info("Speaker similarity scores (threshold=%.2f%s): %s", threshold, legend,
+                 ", ".join(f"{n}={display_scores[n]}" for n in ranked))
         if best_score >= threshold:
             log.info("  → Matched: %s (%.4f)", best_name, best_score)
             return best_name
@@ -138,11 +160,27 @@ class Diarizer:
             log.info("  → No match (best was %s at %.4f)", best_name, best_score)
             return None
 
-    def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD) -> List[Dict]:
+    def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD,
+                attendees: Optional[List[str]] = None) -> List[Dict]:
         """
         Run diarization, align with word timestamps, identify speakers,
         and return grouped segments.
+
+        If `attendees` is provided, enrolled speakers not in the list have
+        ATTENDEE_OFFSET subtracted from their score during identification.
         """
+        # Validate attendees against the enrolled set; log mismatches so name-format
+        # drift (e.g. "Schmitz, TJ" vs "T.J. Schmitz") is visible instead of silent.
+        attendees_set: Optional[set] = None
+        if attendees:
+            enrolled = set(self._store.list_speakers())
+            requested = set(attendees)
+            attendees_set = requested & enrolled
+            unmatched = requested - enrolled
+            if unmatched:
+                log.warning("Attendees not in enrolled set (no offset benefit, no penalty either): %s",
+                            sorted(unmatched))
+            log.info("Attendees recognized for offset (n=%d): %s", len(attendees_set), sorted(attendees_set))
         audio      = _load_audio(audio_path)
         result     = self._pipeline(audio)
         # pyannote 3.3+ returns DiarizeOutput; older versions return Annotation directly
@@ -189,7 +227,7 @@ class Diarizer:
 
                 if embeddings:
                     avg_emb = np.mean(embeddings, axis=0)
-                    name    = self._identify(avg_emb, threshold=threshold)
+                    name    = self._identify(avg_emb, threshold=threshold, attendees=attendees_set)
                     if name:
                         label_map[pyannote_label] = name
                         log.info("Identified %s as: %s", pyannote_label, name)

@@ -15,6 +15,7 @@ os.environ.setdefault("HF_HOME", str(DATA_DIR / "models"))
 import logging
 import tempfile
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -60,21 +61,40 @@ async def health():
 
 
 @app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...), threshold: float = Form(0.35)):
+async def transcribe(
+    audio: UploadFile = File(...),
+    threshold: float = Form(0.35),
+    attendees: Optional[str] = Form(None),
+):
     """
     Transcribe an audio file with speaker diarization.
     Returns a list of speaker-labeled segments.
-    Optional: threshold (float, default 0.35) — speaker identification confidence cutoff.
+
+    Optional form fields:
+      - threshold (float, default 0.35) — speaker identification confidence cutoff.
+      - attendees (str)                 — comma-separated list of enrolled speaker
+                                          names known to be in the meeting. Enrolled
+                                          speakers NOT in this list have 0.15
+                                          subtracted from their similarity score,
+                                          biasing the diarizer toward in-meeting
+                                          candidates. Names must match enrolled
+                                          names exactly (no fuzzy matching).
     """
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await audio.read())
         tmp_path = tmp.name
 
+    attendee_list = None
+    if attendees:
+        attendee_list = [a.strip() for a in attendees.split(",") if a.strip()]
+
     try:
-        log.info("Transcribe request — threshold=%.2f", threshold)
+        log.info("Transcribe request — threshold=%.2f, attendees=%s",
+                 threshold, attendee_list if attendee_list else "(none)")
         words    = _transcriber.transcribe(tmp_path)
-        segments = _diarizer.diarize(tmp_path, words, threshold=threshold)
+        segments = _diarizer.diarize(tmp_path, words, threshold=threshold,
+                                     attendees=attendee_list)
         return JSONResponse({"segments": segments})
     except Exception as e:
         log.exception("Transcription/diarization failed")
