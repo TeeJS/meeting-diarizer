@@ -2,9 +2,12 @@ FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV TZ=America/Denver
 
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip ffmpeg \
+    python3 python3-pip ffmpeg tzdata \
+    && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
