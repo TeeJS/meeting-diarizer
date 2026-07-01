@@ -103,6 +103,42 @@ async def transcribe(
         Path(tmp_path).unlink(missing_ok=True)
 
 
+@app.post("/identify")
+async def identify(
+    audio: UploadFile = File(...),
+    threshold: float = Form(0.35),
+    attendees: Optional[str] = Form(None),
+):
+    """
+    Diagnostic: run diarization + enrolled-speaker identification only — no
+    transcription. Returns each detected speaker cluster with its match (if
+    any) and the full similarity score breakdown against every enrolled
+    speaker, for verifying an enrollment or tuning threshold/attendees.
+
+    Optional form fields: same as /transcribe — threshold, attendees.
+    """
+    suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+
+    attendee_list = None
+    if attendees:
+        attendee_list = [a.strip() for a in attendees.split(",") if a.strip()]
+
+    try:
+        log.info("Identify request — threshold=%.2f, attendees=%s",
+                 threshold, attendee_list if attendee_list else "(none)")
+        clusters = _diarizer.identify_speakers(tmp_path, threshold=threshold,
+                                               attendees=attendee_list)
+        return JSONResponse({"clusters": clusters})
+    except Exception as e:
+        log.exception("Identification failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 @app.post("/enroll")
 async def enroll(name: str = Form(...), audio: UploadFile = File(...)):
     """

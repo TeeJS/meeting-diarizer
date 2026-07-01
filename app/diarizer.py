@@ -119,46 +119,121 @@ class Diarizer:
         log.info("Enrolled speaker: %s", name)
 
     def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD,
-                  attendees: Optional[set] = None) -> Optional[str]:
+                  attendees: Optional[set] = None, return_scores: bool = False):
         """Compare embedding to enrolled speakers. Returns name or None.
 
         If `attendees` is provided, enrolled speakers NOT in that set have
         ATTENDEE_OFFSET subtracted from their similarity score before ranking.
         Attendees in the set keep their raw scores.
+
+        If `return_scores` is True, returns (name_or_None, scores) where
+        scores is a list of per-enrolled-speaker dicts sorted best-first —
+        used by the /identify diagnostic endpoint.
         """
         if np.any(np.isnan(embedding)):
             log.warning("Skipping segment: NaN embedding (segment too short or degenerate)")
-            return None
+            return (None, []) if return_scores else None
+
+        scored = []
         best_name, best_score = None, -1.0
-        # display_scores holds the value used for ranking (adjusted if applicable)
-        # so the log line shows the actual comparison the algorithm did.
-        display_scores = {}
-        raw_scores     = {}
         for name, enrolled in self._store.all_embeddings().items():
             raw = _cosine_similarity(embedding, enrolled)
-            raw_scores[name] = round(raw, 4)
-            if attendees is not None and name not in attendees:
-                adjusted = raw - ATTENDEE_OFFSET
-                display_scores[name] = f"{round(adjusted, 4)} (raw {round(raw, 4)})"
-                score = adjusted
-            else:
-                display_scores[name] = f"{round(raw, 4)}{'*' if attendees is not None else ''}"
-                score = raw
+            is_attendee = attendees is None or name in attendees
+            score = raw if is_attendee else raw - ATTENDEE_OFFSET
+            scored.append({
+                "name":     name,
+                "raw":      round(raw, 4),
+                "score":    round(score, 4),
+                "attendee": is_attendee if attendees is not None else None,
+            })
             if score > best_score:
                 best_name, best_score = name, score
-        # Sort log output by the adjusted/ranked score, descending — matches actual ranking
-        ranked = sorted(raw_scores.keys(),
-                        key=lambda n: (raw_scores[n] - ATTENDEE_OFFSET) if (attendees is not None and n not in attendees) else raw_scores[n],
-                        reverse=True)
+        scored.sort(key=lambda s: s["score"], reverse=True)
+
         legend = " (*=attendee)" if attendees is not None else ""
         log.info("Speaker similarity scores (threshold=%.2f%s): %s", threshold, legend,
-                 ", ".join(f"{n}={display_scores[n]}" for n in ranked))
-        if best_score >= threshold:
+                 ", ".join(f"{s['name']}={s['score']}{'*' if s['attendee'] else ''}" for s in scored))
+
+        matched = best_score >= threshold
+        if matched:
             log.info("  → Matched: %s (%.4f)", best_name, best_score)
-            return best_name
         else:
             log.info("  → No match (best was %s at %.4f)", best_name, best_score)
+
+        result_name = best_name if matched else None
+        return (result_name, scored) if return_scores else result_name
+
+    def _resolve_attendees(self, attendees: Optional[List[str]]) -> Optional[set]:
+        """Validate attendees against the enrolled set; log mismatches so name-format
+        drift (e.g. "Schmitz, TJ" vs "T.J. Schmitz") is visible instead of silent."""
+        if not attendees:
             return None
+        enrolled  = set(self._store.list_speakers())
+        requested = set(attendees)
+        attendees_set = requested & enrolled
+        unmatched = requested - enrolled
+        if unmatched:
+            log.warning("Attendees not in enrolled set (no offset benefit, no penalty either): %s",
+                        sorted(unmatched))
+        log.info("Attendees recognized for offset (n=%d): %s", len(attendees_set), sorted(attendees_set))
+        return attendees_set
+
+    def identify_speakers(self, audio_path: str, threshold: float = SIMILARITY_THRESHOLD,
+                           attendees: Optional[List[str]] = None) -> List[Dict]:
+        """
+        Run diarization + enrolled-speaker identification only — no transcription.
+        Mirrors the clustering and embedding-extraction logic in diarize(), for
+        diagnosing enrollment/threshold issues against a sample clip.
+
+        Returns one entry per detected speaker cluster with its match (if any)
+        and the full similarity score breakdown against every enrolled speaker.
+        """
+        attendees_set = self._resolve_attendees(attendees)
+
+        audio      = _load_audio(audio_path)
+        result     = self._pipeline(audio)
+        annotation = result.speaker_diarization if hasattr(result, "speaker_diarization") else result
+        timeline   = [
+            (turn.start, turn.end, spk)
+            for turn, _, spk in annotation.itertracks(yield_label=True)
+        ]
+        unique_spks = sorted(set(t[2] for t in timeline))
+        index_map   = {spk: i for i, spk in enumerate(unique_spks)}
+
+        clusters = []
+        for pyannote_label in unique_spks:
+            speaker_segs = [Segment(s, e) for s, e, spk in timeline if spk == pyannote_label]
+            duration = sum(seg.end - seg.start for seg in speaker_segs)
+
+            embeddings = []
+            for seg in speaker_segs[:10]:  # cap for speed, matches diarize()
+                try:
+                    if seg.end - seg.start < 0.5:
+                        continue
+                    cropped = _crop_audio(audio, seg.start, seg.end)
+                    emb     = np.array(self._inference(cropped))
+                    if np.any(np.isnan(emb)):
+                        continue
+                    embeddings.append(emb)
+                except Exception:
+                    continue
+
+            entry = {
+                "cluster":       _default_label(pyannote_label, index_map),
+                "segment_count": len(speaker_segs),
+                "duration_sec":  round(duration, 2),
+                "matched":       None,
+                "scores":        [],
+            }
+            if embeddings:
+                avg_emb = np.mean(embeddings, axis=0)
+                name, scores = self._identify(avg_emb, threshold=threshold,
+                                              attendees=attendees_set, return_scores=True)
+                entry["matched"] = name
+                entry["scores"]  = scores
+            clusters.append(entry)
+
+        return clusters
 
     def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD,
                 attendees: Optional[List[str]] = None) -> List[Dict]:
@@ -169,18 +244,7 @@ class Diarizer:
         If `attendees` is provided, enrolled speakers not in the list have
         ATTENDEE_OFFSET subtracted from their score during identification.
         """
-        # Validate attendees against the enrolled set; log mismatches so name-format
-        # drift (e.g. "Schmitz, TJ" vs "T.J. Schmitz") is visible instead of silent.
-        attendees_set: Optional[set] = None
-        if attendees:
-            enrolled = set(self._store.list_speakers())
-            requested = set(attendees)
-            attendees_set = requested & enrolled
-            unmatched = requested - enrolled
-            if unmatched:
-                log.warning("Attendees not in enrolled set (no offset benefit, no penalty either): %s",
-                            sorted(unmatched))
-            log.info("Attendees recognized for offset (n=%d): %s", len(attendees_set), sorted(attendees_set))
+        attendees_set = self._resolve_attendees(attendees)
         audio      = _load_audio(audio_path)
         result     = self._pipeline(audio)
         # pyannote 3.3+ returns DiarizeOutput; older versions return Annotation directly
