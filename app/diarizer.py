@@ -3,8 +3,9 @@ Pyannote speaker diarization + enrolled speaker identification.
 """
 
 import logging
+import os
+import subprocess
 import numpy as np
-import soundfile as sf
 import torch
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -30,11 +31,16 @@ _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 MAX_EMBED_SEGMENTS = 20
 MIN_SEGMENT_SEC    = 0.5    # shorter than this does not embed reliably
 
-# Diarization window. pyannote's clustering degrades over long recordings: on a
-# 42-minute meeting it merged two speakers into one 640s cluster whose blended
-# embedding matched nobody (0.25, margin 0.01), while the same voices in
-# 10-minute windows scored 0.51-0.62. See _diarize_windowed().
-CHUNK_SEC          = 630.0
+# Diarization window, in seconds. Set DIARIZER_CHUNK_SEC very high to disable
+# windowing and diarize in a single pass.
+#
+# The evidence originally used to justify windowing is suspect: the short
+# excerpts it was measured against were 16 kHz WAVs, which skipped the broken
+# resample in _load_audio, while the full-length runs did not. Windowing may
+# therefore have been standing in for the resampling bug. Kept because it is
+# harmless on clean audio and pyannote clustering genuinely is harder over long
+# spans, but the benefit needs re-measuring now that the audio path is fixed.
+CHUNK_SEC          = float(os.environ.get("DIARIZER_CHUNK_SEC", "630"))
 
 # Cosine similarity at which two unidentified clusters from different windows
 # are treated as the same person. Both sides come from the same recording, so
@@ -56,17 +62,33 @@ PYANNOTE_SR = 16000  # sample rate pyannote models expect
 
 
 def _load_audio(path: str) -> dict:
-    """Load audio file as a pyannote-compatible waveform dict using soundfile only."""
-    data, sr = sf.read(path, dtype="float32", always_2d=True)
-    waveform = torch.from_numpy(data.T)          # (channels, samples)
-    if waveform.shape[0] > 1:                    # mix down to mono
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != PYANNOTE_SR:                        # resample if needed
-        orig_len  = waveform.shape[1]
-        new_len   = int(orig_len * PYANNOTE_SR / sr)
-        waveform  = torch.nn.functional.interpolate(
-            waveform.unsqueeze(0), size=new_len, mode="linear", align_corners=False
-        ).squeeze(0)
+    """Decode to 16 kHz mono with ffmpeg, as a pyannote-compatible dict.
+
+    This used to read the file with soundfile and resample with
+    torch.nn.functional.interpolate(mode="linear"), which quietly destroyed
+    long recordings. interpolate computes its source coordinates in the
+    tensor's dtype, and float32 represents consecutive integers exactly only up
+    to 2**24 = 16,777,216. A 42-minute meeting at 48 kHz is 121 million
+    samples, so coordinates beyond roughly the first six minutes were off by
+    1-8 samples, varying with position -- broadband distortion that worsened
+    the further into the file it went. Measured against a float64 reference on
+    a real meeting: 20.4 dB SNR over the first ten minutes, falling to 6.3 dB
+    over the last. Speaker embeddings did not survive it. The same audio range
+    scored 0.5616 for the correct speaker with exact coordinates and 0.1399
+    with float32 ones.
+
+    ffmpeg resamples properly, in one step, with an anti-aliasing filter, and
+    is already how transcriber.py prepares audio -- which is why transcription
+    quality was never affected while identification was.
+    """
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path,
+         "-ac", "1", "-ar", str(PYANNOTE_SR), "-f", "f32le", "-"],
+        check=True, capture_output=True,
+    ).stdout
+    # copy() because frombuffer is read-only and torch needs a writable array
+    samples  = np.frombuffer(out, dtype=np.float32).copy()
+    waveform = torch.from_numpy(samples).unsqueeze(0)   # (1, samples)
     return {"waveform": waveform, "sample_rate": PYANNOTE_SR}
 
 
