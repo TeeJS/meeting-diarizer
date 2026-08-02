@@ -16,7 +16,11 @@ from .enrollment import EnrollmentStore
 
 log = logging.getLogger(__name__)
 
-SIMILARITY_THRESHOLD = 0.35
+# Genuine matches measured across five runs bottomed out at 0.506; confirmed
+# strangers topped out at 0.311 and blended/cross-speaker clusters at 0.362.
+# 0.45 sits in the gap. At the previous 0.35 an unenrolled attendee scored
+# 0.362 against the nearest enrolled voice and was published under their name.
+SIMILARITY_THRESHOLD = 0.45
 ATTENDEE_OFFSET      = 0.15  # subtracted from similarity scores of non-attendees
 EMBEDDING_MODEL      = "pyannote/wespeaker-voxceleb-resnet34-LM"
 _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -26,11 +30,26 @@ _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 MAX_EMBED_SEGMENTS = 20
 MIN_SEGMENT_SEC    = 0.5    # shorter than this does not embed reliably
 
+# Diarization window. pyannote's clustering degrades over long recordings: on a
+# 42-minute meeting it merged two speakers into one 640s cluster whose blended
+# embedding matched nobody (0.25, margin 0.01), while the same voices in
+# 10-minute windows scored 0.51-0.62. See _diarize_windowed().
+CHUNK_SEC          = 630.0
+
+# Cosine similarity at which two unidentified clusters from different windows
+# are treated as the same person. Both sides come from the same recording, so
+# this is an easier comparison than matching against an enrollment.
+UNKNOWN_MERGE_SIM  = 0.55
+
 # Reported in every speaker report so a threshold can be tuned from real runs
 # without re-processing audio (similarity scores do not depend on it).
 THRESHOLD_SWEEP    = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60)
 
 AMBIGUOUS_MARGIN   = 0.05   # best-vs-second gap below which a match is a coin flip
+
+# An unidentified speaker holding at least this share of the meeting is worth
+# enrolling -- they are almost certainly a colleague who will recur.
+ENROLL_CANDIDATE_PCT = 5.0
 
 
 PYANNOTE_SR = 16000  # sample rate pyannote models expect
@@ -112,24 +131,63 @@ def _threshold_sweep(clusters: List[Dict]) -> List[Dict]:
     decides whether `matched` gets populated -- so a single run contains the
     data to evaluate every threshold retrospectively.
 
-    `collisions` counts matched clusters beyond the number of distinct names,
-    i.e. how many times two clusters would claim the same person. A good
-    threshold names most of the speech with few collisions.
+    `collisions` counts, within a single window, matched clusters beyond the
+    number of distinct names -- i.e. two clusters in the same window claiming
+    the same person, which means one speaker was split in two. The same name
+    recurring across windows is expected and is not a collision.
     """
     total = sum(c["duration_sec"] for c in clusters) or 1.0
     sweep = []
     for t in THRESHOLD_SWEEP:
         hits  = [c for c in clusters if c["scores"] and c["scores"][0]["score"] >= t]
         named = sum(c["duration_sec"] for c in hits)
-        distinct = len({c["scores"][0]["name"] for c in hits})
+
+        by_window = {}
+        for c in hits:
+            by_window.setdefault(c.get("window", 0), []).append(c["scores"][0]["name"])
+        collisions = sum(len(v) - len(set(v)) for v in by_window.values())
+
         sweep.append({
             "threshold":        t,
             "clusters_matched": len(hits),
-            "distinct_names":   distinct,
-            "collisions":       len(hits) - distinct,
+            "distinct_names":   len({c["scores"][0]["name"] for c in hits}),
+            "collisions":       collisions,
             "speech_named_pct": round(named / total * 100, 1),
         })
     return sweep
+
+
+def _summarise_speakers(clusters: List[Dict]) -> List[Dict]:
+    """Roll per-window clusters up into one entry per speaker.
+
+    Windowed diarization emits the same person once per window they spoke in;
+    this is the view worth reading.
+    """
+    total = sum(c["duration_sec"] for c in clusters) or 1.0
+    agg: Dict[str, Dict] = {}
+    for c in clusters:
+        a = agg.setdefault(c["cluster"], {
+            "label":        c["cluster"],
+            "identified":   bool(c["matched"]),
+            "duration_sec": 0.0,
+            "windows":      0,
+            "best_score":   None,
+            "nearest":      None,
+        })
+        a["duration_sec"] += c["duration_sec"]
+        a["windows"]      += 1
+        if c["scores"]:
+            top = c["scores"][0]
+            if a["best_score"] is None or top["score"] > a["best_score"]:
+                a["best_score"] = top["score"]
+                a["nearest"]    = top["name"]
+
+    out = []
+    for a in agg.values():
+        a["duration_sec"] = round(a["duration_sec"], 2)
+        a["speech_pct"]   = round(a["duration_sec"] / total * 100, 1)
+        out.append(a)
+    return sorted(out, key=lambda a: -a["duration_sec"])
 
 
 class Diarizer:
@@ -258,22 +316,22 @@ class Diarizer:
         return attendees_set
 
     def _analyze_clusters(self, audio: dict, timeline: List[tuple], threshold: float,
-                          attendees_set: Optional[set]) -> Tuple[Dict[str, str], List[Dict]]:
-        """Embed and identify every speaker cluster in the timeline.
+                          attendees_set: Optional[set]) -> Tuple[List[Dict], Dict]:
+        """Embed and identify every speaker cluster in one window's timeline.
 
-        Shared by diarize() and identify_speakers() so the two cannot drift.
-        Returns (label_map, clusters) where label_map maps a pyannote label to
-        the name to display, and clusters is the per-cluster diagnostic report.
+        Returns (clusters, embeddings). `clusters` is ordered to match
+        sorted(unique pyannote labels); `embeddings` maps a pyannote label to
+        its cluster embedding, used to stitch unidentified speakers across
+        windows.
         """
         unique_spks = sorted(set(t[2] for t in timeline))
         index_map   = {spk: i for i, spk in enumerate(unique_spks)}
-        label_map   = {spk: _default_label(spk, index_map) for spk in unique_spks}
 
         have_enrollments = bool(self._store.list_speakers())
         if not have_enrollments:
             log.warning("No enrolled speakers — clusters will keep generic labels.")
 
-        clusters = []
+        clusters, embeddings = [], {}
         for pyannote_label in unique_spks:
             segs = [Segment(s, e) for s, e, spk in timeline if spk == pyannote_label]
             duration = sum(seg.end - seg.start for seg in segs)
@@ -289,11 +347,13 @@ class Diarizer:
                 "ambiguous":     False,
                 "scores":        [],
             }
+            embeddings[pyannote_label] = None
 
             if have_enrollments:
                 emb, n_used, sec_used = self._cluster_embedding(audio, segs)
                 entry["segments_used"] = n_used
                 entry["seconds_used"]  = round(sec_used, 2)
+                embeddings[pyannote_label] = emb
 
                 if emb is None:
                     log.warning("%s: no segments >= %.1fs (of %d) — cannot identify",
@@ -311,30 +371,42 @@ class Diarizer:
                         margin = round(scores[0]["score"] - scores[1]["score"], 4)
                         entry["margin"]    = margin
                         entry["ambiguous"] = margin < AMBIGUOUS_MARGIN
-                    if name:
-                        label_map[pyannote_label] = name
-                        log.info("Identified %s as: %s", pyannote_label, name)
 
             clusters.append(entry)
 
-        return label_map, clusters
+        return clusters, embeddings
 
-    def _build_report(self, clusters: List[Dict], threshold: float,
-                      attendees_set: Optional[set]) -> Dict:
-        """Wrap the per-cluster results with the totals and the threshold sweep."""
-        total = sum(c["duration_sec"] for c in clusters)
-        named = sum(c["duration_sec"] for c in clusters if c["matched"])
-        matched_names = [c["matched"] for c in clusters if c["matched"]]
-        return {
-            "threshold_used":    threshold,
-            "attendees_applied": sorted(attendees_set) if attendees_set else None,
-            "cluster_count":     len(clusters),
-            "total_speech_sec":  round(total, 2),
-            "speech_named_pct":  round(named / total * 100, 1) if total else 0.0,
-            "collisions":        len(matched_names) - len(set(matched_names)),
-            "clusters":          clusters,
-            "threshold_sweep":   _threshold_sweep(clusters),
-        }
+    def _assign_unknown(self, groups: List[Dict], emb: Optional[np.ndarray]) -> str:
+        """Give an unidentified cluster a label that is stable across windows.
+
+        Enrolled speakers stitch for free -- the same name in two windows is the
+        same person by construction. Everyone else has to be matched window to
+        window by embedding similarity, which is an easier comparison than
+        matching against an enrollment: both sides come from this recording, so
+        room and channel conditions are identical.
+        """
+        if emb is None:
+            return "Unknown"
+
+        best, best_sim = None, -1.0
+        for g in groups:
+            sim = _cosine_similarity(emb, g["mean"])
+            if sim > best_sim:
+                best, best_sim = g, sim
+
+        if best is not None and best_sim >= UNKNOWN_MERGE_SIM:
+            best["embs"].append(emb)
+            mean = np.mean(best["embs"], axis=0)
+            best["mean"] = mean / (np.linalg.norm(mean) + 1e-8)
+            log.info("Unnamed cluster merged into %s (sim=%.4f)", best["label"], best_sim)
+            return best["label"]
+
+        label = (f"Speaker {_LABELS[len(groups)]}" if len(groups) < len(_LABELS)
+                 else f"Speaker {len(groups) + 1}")
+        groups.append({"label": label, "embs": [emb], "mean": emb})
+        log.info("New unnamed speaker %s (closest existing group %.4f)",
+                 label, best_sim if best is not None else -1.0)
+        return label
 
     def _run_pipeline(self, audio: dict) -> List[tuple]:
         """Run diarization and flatten it to (start, end, label) tuples."""
@@ -346,21 +418,111 @@ class Diarizer:
             for turn, _, spk in annotation.itertracks(yield_label=True)
         ]
 
+    def _diarize_windowed(self, audio: dict, threshold: float,
+                          attendees_set: Optional[set]) -> Tuple[List[tuple], List[Dict]]:
+        """Diarize in windows and stitch the speakers back together.
+
+        pyannote's clustering degrades over long recordings -- it merges
+        speakers into blended clusters whose embeddings then match nobody.
+        Diarizing ~10 minutes at a time keeps clustering clean; identities are
+        recombined afterwards, by name for enrolled speakers and by embedding
+        similarity for the rest.
+
+        Recordings shorter than one window take a single pass, so this is a
+        no-op for short clips.
+
+        Returns (timeline, clusters) with timeline in absolute seconds and
+        labels already resolved to their final display names.
+        """
+        sr    = audio["sample_rate"]
+        total = audio["waveform"].shape[1] / sr
+        n     = max(1, int(np.ceil(total / CHUNK_SEC)))
+        width = total / n
+        log.info("Diarizing %.0fs in %d window(s) of %.0fs", total, n, width)
+
+        timeline: List[tuple] = []
+        clusters: List[Dict]  = []
+        unknown:  List[Dict]  = []
+
+        for i in range(n):
+            w_start = i * width
+            w_end   = min((i + 1) * width, total)
+            chunk   = _crop_audio(audio, w_start, w_end)
+
+            local = self._run_pipeline(chunk)
+            if not local:
+                log.info("Window %d (%.0f-%.0fs): no speech detected", i, w_start, w_end)
+                continue
+
+            entries, embeddings = self._analyze_clusters(chunk, local, threshold, attendees_set)
+            spks = sorted(set(t[2] for t in local))
+
+            label_map = {}
+            for spk, entry in zip(spks, entries):
+                if entry["matched"]:
+                    label_map[spk] = entry["matched"]
+                else:
+                    label_map[spk] = self._assign_unknown(unknown, embeddings.get(spk))
+                entry["window"]  = i
+                entry["cluster"] = label_map[spk]
+                clusters.append(entry)
+
+            for st, en, spk in local:
+                timeline.append((st + w_start, en + w_start, label_map[spk]))
+
+        timeline.sort(key=lambda t: t[0])
+        return timeline, clusters
+
+    def _build_report(self, clusters: List[Dict], threshold: float,
+                      attendees_set: Optional[set], window_count: int) -> Dict:
+        """Wrap the per-window clusters with the rolled-up speaker view, the
+        threshold sweep, and anyone worth enrolling."""
+        total    = sum(c["duration_sec"] for c in clusters)
+        speakers = _summarise_speakers(clusters)
+        named    = sum(s["duration_sec"] for s in speakers if s["identified"])
+
+        candidates = [
+            {
+                "label":        s["label"],
+                "duration_sec": s["duration_sec"],
+                "speech_pct":   s["speech_pct"],
+                "nearest":      s["nearest"],
+                "best_score":   s["best_score"],
+            }
+            for s in speakers
+            if not s["identified"] and s["speech_pct"] >= ENROLL_CANDIDATE_PCT
+        ]
+        if candidates:
+            log.warning("Unidentified speakers worth enrolling: %s",
+                        ", ".join(f"{c['label']} ({c['speech_pct']}% of speech)"
+                                  for c in candidates))
+
+        return {
+            "threshold_used":        threshold,
+            "attendees_applied":     sorted(attendees_set) if attendees_set else None,
+            "windows":               window_count,
+            "speaker_count":         len(speakers),
+            "total_speech_sec":      round(total, 2),
+            "speech_named_pct":      round(named / total * 100, 1) if total else 0.0,
+            "speakers":              speakers,
+            "enrollment_candidates": candidates,
+            "clusters":              clusters,
+            "threshold_sweep":       _threshold_sweep(clusters),
+        }
+
     def identify_speakers(self, audio_path: str, threshold: float = SIMILARITY_THRESHOLD,
                            attendees: Optional[List[str]] = None) -> Dict:
         """
         Run diarization + enrolled-speaker identification only — no transcription.
         For diagnosing enrollment/threshold issues against a sample clip.
 
-        Returns the speaker report: one entry per detected cluster with its
-        match, the full similarity breakdown against every enrolled speaker,
-        and a threshold sweep for calibration.
+        Returns the same speaker report that diarize() produces.
         """
-        attendees_set = self._resolve_attendees(attendees)
-        audio         = _load_audio(audio_path)
-        timeline      = self._run_pipeline(audio)
-        _, clusters   = self._analyze_clusters(audio, timeline, threshold, attendees_set)
-        return self._build_report(clusters, threshold, attendees_set)
+        attendees_set     = self._resolve_attendees(attendees)
+        audio             = _load_audio(audio_path)
+        _, clusters       = self._diarize_windowed(audio, threshold, attendees_set)
+        windows           = (max(c["window"] for c in clusters) + 1) if clusters else 0
+        return self._build_report(clusters, threshold, attendees_set, windows)
 
     def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD,
                 attendees: Optional[List[str]] = None) -> Tuple[List[Dict], Dict]:
@@ -371,19 +533,21 @@ class Diarizer:
         If `attendees` is provided, enrolled speakers not in the list have
         ATTENDEE_OFFSET subtracted from their score during identification.
         """
-        attendees_set = self._resolve_attendees(attendees)
-        audio         = _load_audio(audio_path)
-        timeline      = self._run_pipeline(audio)
+        attendees_set      = self._resolve_attendees(attendees)
+        audio              = _load_audio(audio_path)
+        timeline, clusters = self._diarize_windowed(audio, threshold, attendees_set)
+        windows            = (max(c["window"] for c in clusters) + 1) if clusters else 0
 
-        # Assign each word to a speaker by midpoint
+        # Assign each word to a speaker by midpoint. Labels in the timeline are
+        # already final display names, so the map below is an identity.
         for w in words:
             mid = (w["start"] + w["end"]) / 2
-            w["speaker"] = "UNKNOWN"
-            for start, end, spk in timeline:
+            w["speaker"] = "Unknown"
+            for start, end, label in timeline:
                 if start <= mid <= end:
-                    w["speaker"] = spk
+                    w["speaker"] = label
                     break
 
-        label_map, clusters = self._analyze_clusters(audio, timeline, threshold, attendees_set)
-        report = self._build_report(clusters, threshold, attendees_set)
-        return _words_to_segments(words, label_map), report
+        identity = {label: label for _, _, label in timeline}
+        report   = self._build_report(clusters, threshold, attendees_set, windows)
+        return _words_to_segments(words, identity), report

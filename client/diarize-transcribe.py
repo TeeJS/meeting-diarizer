@@ -19,7 +19,7 @@ DIARIZER_HOST      = os.environ.get("DIARIZER_HOST", "192.168.1.25")
 DIARIZER_PORT      = int(os.environ.get("DIARIZER_PORT", "10301"))
 # Matches the service default. This was 0.75, which sits above the score of a
 # correct match on clean audio -- every genuine identification failed.
-DEFAULT_THRESHOLD  = float(os.environ.get("DIARIZER_THRESHOLD", "0.35"))
+DEFAULT_THRESHOLD  = float(os.environ.get("DIARIZER_THRESHOLD", "0.45"))
 
 
 def format_report(report: dict) -> str:
@@ -30,21 +30,41 @@ def format_report(report: dict) -> str:
     out = []
     out.append("=" * 78)
     out.append(f"SPEAKER DETECTION REPORT   threshold={report.get('threshold_used')}"
-               f"   clusters={report.get('cluster_count')}"
+               f"   speakers={report.get('speaker_count')}"
+               f"   windows={report.get('windows')}"
                f"   named={report.get('speech_named_pct')}% of speech")
     if report.get("attendees_applied"):
         out.append(f"attendees applied: {', '.join(report['attendees_applied'])}")
-    if report.get("collisions"):
-        out.append(f"WARNING: {report['collisions']} cluster(s) share a name with "
-                   f"another cluster -- likely one speaker split in two")
     out.append("=" * 78)
+
+    for s in report.get("speakers", []):
+        mark = "OK " if s["identified"] else "-- "
+        near = ""
+        if not s["identified"] and s.get("nearest"):
+            near = f"   nearest {s['nearest']} {s['best_score']:.4f}"
+        out.append(f"  {mark}{s['label']:<20} {s['duration_sec']:>8.1f}s "
+                   f"{s['speech_pct']:>5.1f}%   {s['windows']} window(s){near}")
+
+    cands = report.get("enrollment_candidates", [])
+    if cands:
+        out.append("")
+        out.append("ENROLLMENT CANDIDATES -- unidentified speakers holding real airtime:")
+        for c in cands:
+            out.append(f"  {c['label']:<20} {c['duration_sec']:>8.1f}s "
+                       f"{c['speech_pct']:>5.1f}%   nearest {c['nearest']} "
+                       f"{c['best_score']:.4f}")
+
+    out.append("")
+    out.append("-" * 78)
+    out.append("PER-WINDOW DETAIL")
 
     total = report.get("total_speech_sec") or 1.0
     for c in report.get("clusters", []):
         scores = c.get("scores", [])
         share  = (c["duration_sec"] / total * 100) if total else 0
         out.append("")
-        out.append(f"{c['cluster']}   segments={c['segment_count']}   "
+        out.append(f"[w{c.get('window', 0)}] {c['cluster']}   "
+                   f"segments={c['segment_count']}   "
                    f"duration={c['duration_sec']:.1f}s ({share:.0f}% of speech)")
         out.append(f"   embedded from {c['segments_used']} segment(s), "
                    f"{c['seconds_used']:.1f}s")

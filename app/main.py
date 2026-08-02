@@ -63,7 +63,7 @@ async def health():
 @app.post("/transcribe")
 async def transcribe(
     audio: UploadFile = File(...),
-    threshold: float = Form(0.35),
+    threshold: float = Form(0.45),
     attendees: Optional[str] = Form(None),
 ):
     """
@@ -78,7 +78,12 @@ async def transcribe(
     re-processing any audio.
 
     Optional form fields:
-      - threshold (float, default 0.35) — speaker identification confidence cutoff.
+      - threshold (float, default 0.45) — speaker identification confidence cutoff.
+                                          Measured genuine matches bottom out
+                                          near 0.51 and strangers top out near
+                                          0.36, so 0.45 sits in the gap. Every
+                                          response carries a threshold_sweep
+                                          for retuning this from real runs.
       - attendees (str)                 — comma-separated list of enrolled speaker
                                           names known to be in the meeting. Enrolled
                                           speakers NOT in this list have 0.15
@@ -114,7 +119,7 @@ async def transcribe(
 @app.post("/identify")
 async def identify(
     audio: UploadFile = File(...),
-    threshold: float = Form(0.35),
+    threshold: float = Form(0.45),
     attendees: Optional[str] = Form(None),
 ):
     """
