@@ -15,15 +15,42 @@ class EnrollmentStore:
         self._dir = Path(directory)
         self._dir.mkdir(parents=True, exist_ok=True)
 
+    def _path_for(self, name: str) -> Path:
+        """Resolve a speaker name to its file, refusing anything that would
+        escape the enrollment directory. Names arrive from HTTP form fields and
+        are used directly as filenames."""
+        n = (name or "").strip()
+        if not n or n in (".", "..") or any(c in n for c in "/\\\x00"):
+            raise ValueError(f"invalid speaker name: {name!r}")
+        path = (self._dir / f"{n}.npy").resolve()
+        if path.parent != self._dir.resolve():
+            raise ValueError(f"invalid speaker name: {name!r}")
+        return path
+
     def save(self, name: str, embedding: np.ndarray):
-        path = self._dir / f"{name}.npy"
+        path = self._path_for(name)
         np.save(path, embedding)
         log.info("Saved embedding for speaker: %s", name)
 
     def delete_speaker(self, name: str):
-        path = self._dir / f"{name}.npy"
-        path.unlink(missing_ok=True)
+        self._path_for(name).unlink(missing_ok=True)
         log.info("Deleted embedding for speaker: %s", name)
+
+    def rename_speaker(self, old: str, new: str):
+        """Move an existing embedding to a new name.
+
+        Renaming does not need the original audio, which matters because
+        directory renames (Matt -> Matthew) would otherwise force a
+        re-enrollment nobody has a reference recording for.
+        """
+        src = self._path_for(old)
+        dst = self._path_for(new)
+        if not src.exists():
+            raise FileNotFoundError(f"no enrolled speaker named {old!r}")
+        if dst.exists():
+            raise FileExistsError(f"a speaker named {new!r} is already enrolled")
+        src.rename(dst)
+        log.info("Renamed enrolled speaker: %s -> %s", old, new)
 
     def list_speakers(self) -> List[str]:
         return sorted(p.stem for p in self._dir.glob("*.npy"))

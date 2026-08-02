@@ -18,7 +18,8 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from .transcriber import Transcriber
 from .diarizer import Diarizer
@@ -53,6 +54,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Meeting Diarizer", version="1.0.0", lifespan=lifespan)
+
+
+app.mount("/ui", StaticFiles(directory=Path(__file__).parent / "static", html=True),
+          name="ui")
+
+
+@app.get("/")
+async def root():
+    """Send a bare visit to the enrollment UI."""
+    return RedirectResponse(url="/ui/")
 
 
 @app.get("/health")
@@ -166,6 +177,8 @@ async def enroll(name: str = Form(...), audio: UploadFile = File(...)):
     try:
         _diarizer.enroll_speaker(name, tmp_path)
         return {"status": "enrolled", "name": name}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         log.exception("Enrollment failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -179,8 +192,30 @@ async def list_speakers():
     return {"speakers": _store.list_speakers()}
 
 
+@app.post("/speakers/{name}/rename")
+async def rename_speaker(name: str, new_name: str = Form(...)):
+    """Rename an enrolled speaker, keeping their existing voice embedding.
+
+    Directory renames (a "Matt" becoming a "Matthew") would otherwise require
+    re-enrolling from reference audio nobody kept. The embedding is unchanged;
+    only the label moves.
+    """
+    try:
+        _store.rename_speaker(name, new_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except FileExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "renamed", "from": name, "to": new_name}
+
+
 @app.delete("/speakers/{name}")
 async def delete_speaker(name: str):
     """Remove an enrolled speaker."""
-    _store.delete_speaker(name)
+    try:
+        _store.delete_speaker(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"status": "deleted", "name": name}

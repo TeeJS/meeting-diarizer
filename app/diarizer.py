@@ -4,6 +4,7 @@ Pyannote speaker diarization + enrolled speaker identification.
 
 import logging
 import os
+import re
 import subprocess
 import numpy as np
 import torch
@@ -102,6 +103,30 @@ def _crop_audio(audio: dict, start: float, end: float) -> dict:
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+def normalize_name(name: str) -> str:
+    """Fold a display name to a comparison key.
+
+    Teams writes "Evenson, Matthew" while Outlook writes "Matthew Evenson" for
+    the same person, and both forms appear throughout real calendar data. Exact
+    string matching therefore fails depending on which system an attendee list
+    was copied from -- and a failed match is worse than passing no attendees at
+    all, because the speaker is then treated as absent and takes the
+    ATTENDEE_OFFSET penalty against their own voice.
+
+    Word order, punctuation, spacing and case are folded, so "Schmitz, TJ",
+    "Schmitz, T.J." and "T.J. Schmitz" all agree. Diminutives are left alone:
+    "Matt" and "Matthew" are deliberately NOT treated as equal, since guessing
+    there risks merging two real people. Unmatched names are logged so the
+    drift stays visible.
+    """
+    n = (name or "").strip()
+    if "," in n:
+        last, _, first = n.partition(",")
+        n = f"{first.strip()} {last.strip()}"
+    # drop rather than substitute, so "T.J." and "TJ" collapse the same way
+    return re.sub(r"[^0-9a-z]", "", n.lower())
 
 
 def _default_label(pyannote_label: str, index_map: dict) -> str:
@@ -323,18 +348,31 @@ class Diarizer:
         return (result_name, scored) if return_scores else result_name
 
     def _resolve_attendees(self, attendees: Optional[List[str]]) -> Optional[set]:
-        """Validate attendees against the enrolled set; log mismatches so name-format
-        drift (e.g. "Schmitz, TJ" vs "T.J. Schmitz") is visible instead of silent."""
+        """Map requested attendee names onto enrolled speakers.
+
+        Matching is done on normalize_name(), so "Evenson, Matthew" from a Teams
+        transcript and "Matthew Evenson" from an Outlook invite both resolve to
+        the same enrollment. Names that still fail to match are logged, since a
+        silent miss costs that speaker the attendee offset against their own
+        voice.
+        """
         if not attendees:
             return None
-        enrolled  = set(self._store.list_speakers())
-        requested = set(attendees)
-        attendees_set = requested & enrolled
-        unmatched = requested - enrolled
+
+        by_norm = {normalize_name(e): e for e in self._store.list_speakers()}
+        attendees_set, unmatched = set(), []
+        for requested in attendees:
+            enrolled = by_norm.get(normalize_name(requested))
+            if enrolled:
+                attendees_set.add(enrolled)
+            else:
+                unmatched.append(requested)
+
         if unmatched:
-            log.warning("Attendees not in enrolled set (no offset benefit, no penalty either): %s",
-                        sorted(unmatched))
-        log.info("Attendees recognized for offset (n=%d): %s", len(attendees_set), sorted(attendees_set))
+            log.warning("Attendees not in enrolled set (no offset benefit, no penalty "
+                        "either) — check for a directory rename: %s", sorted(unmatched))
+        log.info("Attendees recognized for offset (n=%d): %s",
+                 len(attendees_set), sorted(attendees_set))
         return attendees_set
 
     def _analyze_clusters(self, audio: dict, timeline: List[tuple], threshold: float,

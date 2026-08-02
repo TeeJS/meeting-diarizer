@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Diarizer — Speakers</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --line: #dfe3e8; --ink: #1b1f24;
+    --muted: #656d76; --accent: #2563eb; --danger: #b42318; --ok: #067647;
+    --chip: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --panel: #1c2024; --line: #2f353b; --ink: #e6e9ec;
+      --muted: #9198a1; --accent: #60a5fa; --danger: #f97066; --ok: #47cd89;
+      --chip: #262c32;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em;
+             color: var(--muted); margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tr:last-child td { border-bottom: 0; }
+  .name { font-weight: 600; }
+  .actions { text-align: right; white-space: nowrap; }
+  button, input[type=text], input[type=file] {
+    font: inherit; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--ink); padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input[type=text] { width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > .grow { flex: 1 1 220px; }
+  .msg { margin-top: 12px; padding: 9px 12px; border-radius: 7px;
+         font-size: 14px; display: none; }
+  .msg.show { display: block; }
+  .msg.ok { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  .msg.err { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .count { background: var(--chip); border-radius: 20px; padding: 1px 9px;
+           font-size: 12px; color: var(--muted); margin-left: 6px; }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Speaker Enrollments</h1>
+  <div class="sub">meeting-diarizer &mdash; voice profiles used to put names on transcript segments</div>
+
+  <div class="card">
+    <h2>Enrolled <span class="count" id="count">…</span></h2>
+    <table><tbody id="list"></tbody></table>
+    <div class="msg" id="listMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Enroll a new speaker</h2>
+    <div class="row">
+      <input type="text" id="newName" class="grow" placeholder="Name, exactly as your calendar writes it">
+      <input type="file" id="newFile" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg">
+      <button class="primary" id="enrollBtn">Enroll</button>
+    </div>
+    <div class="hint">
+      One to two minutes of that person speaking alone. Audio recorded the same way
+      your meetings are beats a clean studio sample &mdash; the comparison is
+      like&#8209;for&#8209;like. Any voice other than theirs in the clip will poison the profile.
+    </div>
+    <div class="msg" id="enrollMsg"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function say(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg show " + (ok ? "ok" : "err");
+  if (ok) setTimeout(() => { el.className = "msg"; }, 4000);
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (e) { /* non-JSON error page */ }
+  if (!r.ok) throw new Error((body && body.detail) || (r.status + " " + r.statusText));
+  return body;
+}
+
+async function load() {
+  const tbody = $("list");
+  try {
+    const data = await api("../speakers");
+    const names = data.speakers || [];
+    $("count").textContent = names.length;
+    tbody.innerHTML = "";
+    if (!names.length) {
+      tbody.innerHTML = '<tr><td class="empty">Nobody enrolled yet.</td></tr>';
+      return;
+    }
+    for (const name of names) tbody.appendChild(rowFor(name));
+  } catch (e) {
+    say($("listMsg"), "Could not load speakers: " + e.message, false);
+  }
+}
+
+function rowFor(name) {
+  const tr = document.createElement("tr");
+
+  const tdName = document.createElement("td");
+  tdName.className = "name";
+  tdName.textContent = name;
+
+  const tdAct = document.createElement("td");
+  tdAct.className = "actions";
+
+  const renameBtn = document.createElement("button");
+  renameBtn.textContent = "Rename";
+  renameBtn.onclick = () => startRename(tr, tdName, tdAct, name);
+
+  const delBtn = document.createElement("button");
+  delBtn.textContent = "Delete";
+  delBtn.className = "danger";
+  delBtn.onclick = async () => {
+    if (!confirm('Delete the voice profile for "' + name + '"?\n\nThe audio it came from is not stored, so re-enrolling needs a new sample.')) return;
+    delBtn.disabled = true;
+    try {
+      await api("../speakers/" + encodeURIComponent(name), { method: "DELETE" });
+      await load();
+      say($("listMsg"), 'Deleted "' + name + '".', true);
+    } catch (e) {
+      delBtn.disabled = false;
+      say($("listMsg"), "Delete failed: " + e.message, false);
+    }
+  };
+
+  tdAct.append(renameBtn, " ", delBtn);
+  tr.append(tdName, tdAct);
+  return tr;
+}
+
+function startRename(tr, tdName, tdAct, name) {
+  tdName.innerHTML = "";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = name;
+  tdName.appendChild(input);
+  input.focus();
+  input.select();
+
+  tdAct.innerHTML = "";
+  const save = document.createElement("button");
+  save.textContent = "Save";
+  save.className = "primary";
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  cancel.onclick = load;
+
+  save.onclick = async () => {
+    const next = input.value.trim();
+    if (!next || next === name) return load();
+    save.disabled = true;
+    const fd = new FormData();
+    fd.append("new_name", next);
+    try {
+      await api("../speakers/" + encodeURIComponent(name) + "/rename",
+                { method: "POST", body: fd });
+      await load();
+      say($("listMsg"), 'Renamed "' + name + '" to "' + next + '". The voice profile is unchanged.', true);
+    } catch (e) {
+      save.disabled = false;
+      say($("listMsg"), "Rename failed: " + e.message, false);
+    }
+  };
+  input.onkeydown = e => {
+    if (e.key === "Enter") save.onclick();
+    if (e.key === "Escape") load();
+  };
+
+  tdAct.append(save, " ", cancel);
+}
+
+$("enrollBtn").onclick = async () => {
+  const name = $("newName").value.trim();
+  const file = $("newFile").files[0];
+  if (!name)  return say($("enrollMsg"), "Give the speaker a name.", false);
+  if (!file)  return say($("enrollMsg"), "Choose an audio file.", false);
+
+  const btn = $("enrollBtn");
+  btn.disabled = true;
+  btn.textContent = "Enrolling…";
+  const fd = new FormData();
+  fd.append("name", name);
+  fd.append("audio", file);
+  try {
+    await api("../enroll", { method: "POST", body: fd });
+    $("newName").value = "";
+    $("newFile").value = "";
+    await load();
+    say($("enrollMsg"), 'Enrolled "' + name + '".', true);
+  } catch (e) {
+    say($("enrollMsg"), "Enrollment failed: " + e.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Enroll";
+  }
+};
+
+load();
+</script>
+</body>
+</html>
