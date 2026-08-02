@@ -7,7 +7,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from pyannote.audio import Pipeline, Model, Inference
 from pyannote.core import Segment
@@ -20,6 +20,17 @@ SIMILARITY_THRESHOLD = 0.35
 ATTENDEE_OFFSET      = 0.15  # subtracted from similarity scores of non-attendees
 EMBEDDING_MODEL      = "pyannote/wespeaker-voxceleb-resnet34-LM"
 _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Segment selection for cluster embeddings. These are chosen longest-first --
+# see _cluster_embedding() for why the order matters more than the count.
+MAX_EMBED_SEGMENTS = 20
+MIN_SEGMENT_SEC    = 0.5    # shorter than this does not embed reliably
+
+# Reported in every speaker report so a threshold can be tuned from real runs
+# without re-processing audio (similarity scores do not depend on it).
+THRESHOLD_SWEEP    = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60)
+
+AMBIGUOUS_MARGIN   = 0.05   # best-vs-second gap below which a match is a coin flip
 
 
 PYANNOTE_SR = 16000  # sample rate pyannote models expect
@@ -94,6 +105,33 @@ def _words_to_segments(words: List[Dict], label_map: Dict[str, str]) -> List[Dic
     return [s for s in segments if s["text"]]
 
 
+def _threshold_sweep(clusters: List[Dict]) -> List[Dict]:
+    """What each candidate threshold would have produced for this recording.
+
+    Similarity scores are computed independently of the threshold -- it only
+    decides whether `matched` gets populated -- so a single run contains the
+    data to evaluate every threshold retrospectively.
+
+    `collisions` counts matched clusters beyond the number of distinct names,
+    i.e. how many times two clusters would claim the same person. A good
+    threshold names most of the speech with few collisions.
+    """
+    total = sum(c["duration_sec"] for c in clusters) or 1.0
+    sweep = []
+    for t in THRESHOLD_SWEEP:
+        hits  = [c for c in clusters if c["scores"] and c["scores"][0]["score"] >= t]
+        named = sum(c["duration_sec"] for c in hits)
+        distinct = len({c["scores"][0]["name"] for c in hits})
+        sweep.append({
+            "threshold":        t,
+            "clusters_matched": len(hits),
+            "distinct_names":   distinct,
+            "collisions":       len(hits) - distinct,
+            "speech_named_pct": round(named / total * 100, 1),
+        })
+    return sweep
+
+
 class Diarizer:
     def __init__(self, hf_token: str, enrollment_store: EnrollmentStore):
         log.info("Loading pyannote speaker-diarization-3.1 ...")
@@ -117,6 +155,47 @@ class Diarizer:
         embedding = self._inference(audio)
         self._store.save(name, np.array(embedding))
         log.info("Enrolled speaker: %s", name)
+
+    def _cluster_embedding(self, audio: dict, segs: List[Segment]) -> Tuple:
+        """Compute one averaged embedding representing a speaker cluster.
+
+        Segments are selected LONGEST-FIRST rather than in the order pyannote
+        emitted them. Chronological order put the opening moments of the
+        meeting first -- greetings, "yeah", "mhm" -- which embed poorly, and it
+        penalised the people who spoke most, since their leading segments were
+        the least representative slice of their speech.
+
+        Each segment embedding is L2-normalised before averaging so that a
+        single loud or long segment cannot dominate the mean direction.
+
+        Returns (embedding_or_None, segments_used, seconds_used).
+        """
+        usable = [s for s in segs if (s.end - s.start) >= MIN_SEGMENT_SEC]
+        usable.sort(key=lambda s: s.end - s.start, reverse=True)
+
+        embeddings, used_sec = [], 0.0
+        for seg in usable[:MAX_EMBED_SEGMENTS]:
+            try:
+                cropped = _crop_audio(audio, seg.start, seg.end)
+                emb     = np.array(self._inference(cropped))
+                if np.any(np.isnan(emb)):
+                    log.warning("Skipping %.2fs segment [%.2f-%.2f]: NaN embedding",
+                                seg.end - seg.start, seg.start, seg.end)
+                    continue
+                norm = float(np.linalg.norm(emb))
+                if norm < 1e-8:
+                    continue
+                embeddings.append(emb / norm)
+                used_sec += seg.end - seg.start
+            except Exception:
+                continue
+
+        if not embeddings:
+            return None, 0, 0.0
+
+        avg = np.mean(embeddings, axis=0)
+        avg = avg / (np.linalg.norm(avg) + 1e-8)
+        return avg, len(embeddings), used_sec
 
     def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD,
                   attendees: Optional[set] = None, return_scores: bool = False):
@@ -178,83 +257,123 @@ class Diarizer:
         log.info("Attendees recognized for offset (n=%d): %s", len(attendees_set), sorted(attendees_set))
         return attendees_set
 
-    def identify_speakers(self, audio_path: str, threshold: float = SIMILARITY_THRESHOLD,
-                           attendees: Optional[List[str]] = None) -> List[Dict]:
-        """
-        Run diarization + enrolled-speaker identification only — no transcription.
-        Mirrors the clustering and embedding-extraction logic in diarize(), for
-        diagnosing enrollment/threshold issues against a sample clip.
+    def _analyze_clusters(self, audio: dict, timeline: List[tuple], threshold: float,
+                          attendees_set: Optional[set]) -> Tuple[Dict[str, str], List[Dict]]:
+        """Embed and identify every speaker cluster in the timeline.
 
-        Returns one entry per detected speaker cluster with its match (if any)
-        and the full similarity score breakdown against every enrolled speaker.
+        Shared by diarize() and identify_speakers() so the two cannot drift.
+        Returns (label_map, clusters) where label_map maps a pyannote label to
+        the name to display, and clusters is the per-cluster diagnostic report.
         """
-        attendees_set = self._resolve_attendees(attendees)
-
-        audio      = _load_audio(audio_path)
-        result     = self._pipeline(audio)
-        annotation = result.speaker_diarization if hasattr(result, "speaker_diarization") else result
-        timeline   = [
-            (turn.start, turn.end, spk)
-            for turn, _, spk in annotation.itertracks(yield_label=True)
-        ]
         unique_spks = sorted(set(t[2] for t in timeline))
         index_map   = {spk: i for i, spk in enumerate(unique_spks)}
+        label_map   = {spk: _default_label(spk, index_map) for spk in unique_spks}
+
+        have_enrollments = bool(self._store.list_speakers())
+        if not have_enrollments:
+            log.warning("No enrolled speakers — clusters will keep generic labels.")
 
         clusters = []
         for pyannote_label in unique_spks:
-            speaker_segs = [Segment(s, e) for s, e, spk in timeline if spk == pyannote_label]
-            duration = sum(seg.end - seg.start for seg in speaker_segs)
-
-            embeddings = []
-            for seg in speaker_segs[:10]:  # cap for speed, matches diarize()
-                try:
-                    if seg.end - seg.start < 0.5:
-                        continue
-                    cropped = _crop_audio(audio, seg.start, seg.end)
-                    emb     = np.array(self._inference(cropped))
-                    if np.any(np.isnan(emb)):
-                        continue
-                    embeddings.append(emb)
-                except Exception:
-                    continue
+            segs = [Segment(s, e) for s, e, spk in timeline if spk == pyannote_label]
+            duration = sum(seg.end - seg.start for seg in segs)
 
             entry = {
                 "cluster":       _default_label(pyannote_label, index_map),
-                "segment_count": len(speaker_segs),
+                "segment_count": len(segs),
                 "duration_sec":  round(duration, 2),
+                "segments_used": 0,
+                "seconds_used":  0.0,
                 "matched":       None,
+                "margin":        None,
+                "ambiguous":     False,
                 "scores":        [],
             }
-            if embeddings:
-                avg_emb = np.mean(embeddings, axis=0)
-                name, scores = self._identify(avg_emb, threshold=threshold,
-                                              attendees=attendees_set, return_scores=True)
-                entry["matched"] = name
-                entry["scores"]  = scores
+
+            if have_enrollments:
+                emb, n_used, sec_used = self._cluster_embedding(audio, segs)
+                entry["segments_used"] = n_used
+                entry["seconds_used"]  = round(sec_used, 2)
+
+                if emb is None:
+                    log.warning("%s: no segments >= %.1fs (of %d) — cannot identify",
+                                entry["cluster"], MIN_SEGMENT_SEC, len(segs))
+                else:
+                    log.info("%s: embedding from %d segment(s), %.1fs of speech "
+                             "(cluster total %.1fs)",
+                             entry["cluster"], n_used, sec_used, duration)
+                    name, scores = self._identify(emb, threshold=threshold,
+                                                  attendees=attendees_set,
+                                                  return_scores=True)
+                    entry["matched"] = name
+                    entry["scores"]  = scores
+                    if len(scores) > 1:
+                        margin = round(scores[0]["score"] - scores[1]["score"], 4)
+                        entry["margin"]    = margin
+                        entry["ambiguous"] = margin < AMBIGUOUS_MARGIN
+                    if name:
+                        label_map[pyannote_label] = name
+                        log.info("Identified %s as: %s", pyannote_label, name)
+
             clusters.append(entry)
 
-        return clusters
+        return label_map, clusters
+
+    def _build_report(self, clusters: List[Dict], threshold: float,
+                      attendees_set: Optional[set]) -> Dict:
+        """Wrap the per-cluster results with the totals and the threshold sweep."""
+        total = sum(c["duration_sec"] for c in clusters)
+        named = sum(c["duration_sec"] for c in clusters if c["matched"])
+        matched_names = [c["matched"] for c in clusters if c["matched"]]
+        return {
+            "threshold_used":    threshold,
+            "attendees_applied": sorted(attendees_set) if attendees_set else None,
+            "cluster_count":     len(clusters),
+            "total_speech_sec":  round(total, 2),
+            "speech_named_pct":  round(named / total * 100, 1) if total else 0.0,
+            "collisions":        len(matched_names) - len(set(matched_names)),
+            "clusters":          clusters,
+            "threshold_sweep":   _threshold_sweep(clusters),
+        }
+
+    def _run_pipeline(self, audio: dict) -> List[tuple]:
+        """Run diarization and flatten it to (start, end, label) tuples."""
+        result = self._pipeline(audio)
+        # pyannote 3.3+ returns DiarizeOutput; older versions return Annotation directly
+        annotation = result.speaker_diarization if hasattr(result, "speaker_diarization") else result
+        return [
+            (turn.start, turn.end, spk)
+            for turn, _, spk in annotation.itertracks(yield_label=True)
+        ]
+
+    def identify_speakers(self, audio_path: str, threshold: float = SIMILARITY_THRESHOLD,
+                           attendees: Optional[List[str]] = None) -> Dict:
+        """
+        Run diarization + enrolled-speaker identification only — no transcription.
+        For diagnosing enrollment/threshold issues against a sample clip.
+
+        Returns the speaker report: one entry per detected cluster with its
+        match, the full similarity breakdown against every enrolled speaker,
+        and a threshold sweep for calibration.
+        """
+        attendees_set = self._resolve_attendees(attendees)
+        audio         = _load_audio(audio_path)
+        timeline      = self._run_pipeline(audio)
+        _, clusters   = self._analyze_clusters(audio, timeline, threshold, attendees_set)
+        return self._build_report(clusters, threshold, attendees_set)
 
     def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD,
-                attendees: Optional[List[str]] = None) -> List[Dict]:
+                attendees: Optional[List[str]] = None) -> Tuple[List[Dict], Dict]:
         """
         Run diarization, align with word timestamps, identify speakers,
-        and return grouped segments.
+        and return (segments, speaker_report).
 
         If `attendees` is provided, enrolled speakers not in the list have
         ATTENDEE_OFFSET subtracted from their score during identification.
         """
         attendees_set = self._resolve_attendees(attendees)
-        audio      = _load_audio(audio_path)
-        result     = self._pipeline(audio)
-        # pyannote 3.3+ returns DiarizeOutput; older versions return Annotation directly
-        annotation = result.speaker_diarization if hasattr(result, "speaker_diarization") else result
-        timeline   = [
-            (turn.start, turn.end, spk)
-            for turn, _, spk in annotation.itertracks(yield_label=True)
-        ]
-        unique_spks = sorted(set(t[2] for t in timeline))
-        index_map   = {spk: i for i, spk in enumerate(unique_spks)}
+        audio         = _load_audio(audio_path)
+        timeline      = self._run_pipeline(audio)
 
         # Assign each word to a speaker by midpoint
         for w in words:
@@ -265,35 +384,6 @@ class Diarizer:
                     w["speaker"] = spk
                     break
 
-        # Build label map: start with default labels, then try enrolled speakers
-        label_map = {spk: _default_label(spk, index_map) for spk in unique_spks}
-
-        if self._store.list_speakers():
-            for pyannote_label in unique_spks:
-                speaker_segs = [
-                    Segment(s, e) for s, e, spk in timeline
-                    if spk == pyannote_label
-                ]
-                embeddings = []
-                for seg in speaker_segs[:10]:  # cap for speed
-                    try:
-                        if seg.end - seg.start < 0.5:  # skip segments too short to embed reliably
-                            continue
-                        cropped = _crop_audio(audio, seg.start, seg.end)
-                        emb     = np.array(self._inference(cropped))
-                        if np.any(np.isnan(emb)):
-                            log.warning("Skipping %.2fs segment [%.2f-%.2f]: NaN embedding",
-                                        seg.end - seg.start, seg.start, seg.end)
-                            continue
-                        embeddings.append(emb)
-                    except Exception:
-                        continue
-
-                if embeddings:
-                    avg_emb = np.mean(embeddings, axis=0)
-                    name    = self._identify(avg_emb, threshold=threshold, attendees=attendees_set)
-                    if name:
-                        label_map[pyannote_label] = name
-                        log.info("Identified %s as: %s", pyannote_label, name)
-
-        return _words_to_segments(words, label_map)
+        label_map, clusters = self._analyze_clusters(audio, timeline, threshold, attendees_set)
+        report = self._build_report(clusters, threshold, attendees_set)
+        return _words_to_segments(words, label_map), report

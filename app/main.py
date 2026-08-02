@@ -68,7 +68,14 @@ async def transcribe(
 ):
     """
     Transcribe an audio file with speaker diarization.
-    Returns a list of speaker-labeled segments.
+
+    Returns {"speaker_report": {...}, "segments": [...]}. The report carries
+    one entry per detected speaker cluster — how much it spoke, what it
+    matched, the margin over the runner-up, and the full similarity breakdown
+    — plus a threshold sweep showing what every candidate threshold would have
+    produced for this recording. Similarity scores do not depend on the
+    threshold, so the sweep lets a threshold be tuned from past runs without
+    re-processing any audio.
 
     Optional form fields:
       - threshold (float, default 0.35) — speaker identification confidence cutoff.
@@ -92,10 +99,11 @@ async def transcribe(
     try:
         log.info("Transcribe request — threshold=%.2f, attendees=%s",
                  threshold, attendee_list if attendee_list else "(none)")
-        words    = _transcriber.transcribe(tmp_path)
-        segments = _diarizer.diarize(tmp_path, words, threshold=threshold,
-                                     attendees=attendee_list)
-        return JSONResponse({"segments": segments})
+        words = _transcriber.transcribe(tmp_path)
+        segments, report = _diarizer.diarize(tmp_path, words, threshold=threshold,
+                                             attendees=attendee_list)
+        # speaker_report first so it reads at the top of a saved JSON file
+        return JSONResponse({"speaker_report": report, "segments": segments})
     except Exception as e:
         log.exception("Transcription/diarization failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -111,9 +119,9 @@ async def identify(
 ):
     """
     Diagnostic: run diarization + enrolled-speaker identification only — no
-    transcription. Returns each detected speaker cluster with its match (if
-    any) and the full similarity score breakdown against every enrolled
-    speaker, for verifying an enrollment or tuning threshold/attendees.
+    transcription. Returns the same speaker_report that /transcribe embeds,
+    for verifying an enrollment or tuning threshold/attendees without paying
+    for transcription.
 
     Optional form fields: same as /transcribe — threshold, attendees.
     """
@@ -129,9 +137,9 @@ async def identify(
     try:
         log.info("Identify request — threshold=%.2f, attendees=%s",
                  threshold, attendee_list if attendee_list else "(none)")
-        clusters = _diarizer.identify_speakers(tmp_path, threshold=threshold,
-                                               attendees=attendee_list)
-        return JSONResponse({"clusters": clusters})
+        report = _diarizer.identify_speakers(tmp_path, threshold=threshold,
+                                             attendees=attendee_list)
+        return JSONResponse(report)
     except Exception as e:
         log.exception("Identification failed")
         raise HTTPException(status_code=500, detail=str(e))
