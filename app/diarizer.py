@@ -251,12 +251,17 @@ class Diarizer:
         Each segment embedding is L2-normalised before averaging so that a
         single loud or long segment cannot dominate the mean direction.
 
-        Returns (embedding_or_None, segments_used, seconds_used).
+        Returns (embedding_or_None, used) where `used` lists the (start, end)
+        spans that actually contributed. Those spans are reported so a speaker's
+        best audio can be cut back out of the recording and re-enrolled --
+        enrolling from the setup a person is actually recorded on is worth far
+        more than enrolling from a clean reference (one speaker went from 0.5739
+        to 0.9755 on exactly that change).
         """
         usable = [s for s in segs if (s.end - s.start) >= MIN_SEGMENT_SEC]
         usable.sort(key=lambda s: s.end - s.start, reverse=True)
 
-        embeddings, used_sec = [], 0.0
+        embeddings, used = [], []
         for seg in usable[:MAX_EMBED_SEGMENTS]:
             try:
                 cropped = _crop_audio(audio, seg.start, seg.end)
@@ -269,16 +274,16 @@ class Diarizer:
                 if norm < 1e-8:
                     continue
                 embeddings.append(emb / norm)
-                used_sec += seg.end - seg.start
+                used.append((seg.start, seg.end))
             except Exception:
                 continue
 
         if not embeddings:
-            return None, 0, 0.0
+            return None, []
 
         avg = np.mean(embeddings, axis=0)
         avg = avg / (np.linalg.norm(avg) + 1e-8)
-        return avg, len(embeddings), used_sec
+        return avg, used
 
     def _identify(self, embedding: np.ndarray, threshold: float = SIMILARITY_THRESHOLD,
                   attendees: Optional[set] = None, return_scores: bool = False):
@@ -378,6 +383,7 @@ class Diarizer:
                 "duration_sec":  round(duration, 2),
                 "segments_used": 0,
                 "seconds_used":  0.0,
+                "embed_segments": [],
                 "matched":       None,
                 "margin":        None,
                 "ambiguous":     False,
@@ -385,9 +391,11 @@ class Diarizer:
             }
 
             if have_enrollments:
-                emb, n_used, sec_used = self._cluster_embedding(audio, segs)
-                entry["segments_used"] = n_used
-                entry["seconds_used"]  = round(sec_used, 2)
+                emb, used = self._cluster_embedding(audio, segs)
+                sec_used = sum(e - s for s, e in used)
+                entry["segments_used"]  = len(used)
+                entry["seconds_used"]   = round(sec_used, 2)
+                entry["embed_segments"] = [[round(s, 2), round(e, 2)] for s, e in used]
 
                 if emb is None:
                     log.warning("%s: no segments >= %.1fs (of %d) — cannot identify",
@@ -395,7 +403,7 @@ class Diarizer:
                 else:
                     log.info("%s: embedding from %d segment(s), %.1fs of speech "
                              "(cluster total %.1fs)",
-                             entry["cluster"], n_used, sec_used, duration)
+                             entry["cluster"], len(used), sec_used, duration)
                     name, scores = self._identify(emb, threshold=threshold,
                                                   attendees=attendees_set,
                                                   return_scores=True)
