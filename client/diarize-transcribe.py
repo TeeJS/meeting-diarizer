@@ -31,7 +31,6 @@ def format_report(report: dict) -> str:
     out.append("=" * 78)
     out.append(f"SPEAKER DETECTION REPORT   threshold={report.get('threshold_used')}"
                f"   speakers={report.get('speaker_count')}"
-               f"   windows={report.get('windows')}"
                f"   named={report.get('speech_named_pct')}% of speech")
     if report.get("attendees_applied"):
         out.append(f"attendees applied: {', '.join(report['attendees_applied'])}")
@@ -42,8 +41,10 @@ def format_report(report: dict) -> str:
         near = ""
         if not s["identified"] and s.get("nearest"):
             near = f"   nearest {s['nearest']} {s['best_score']:.4f}"
+        split = (f"   split across {s['clusters']} clusters"
+                 if s.get("clusters", 1) > 1 else "")
         out.append(f"  {mark}{s['label']:<20} {s['duration_sec']:>8.1f}s "
-                   f"{s['speech_pct']:>5.1f}%   {s['windows']} window(s){near}")
+                   f"{s['speech_pct']:>5.1f}%{split}{near}")
 
     cands = report.get("enrollment_candidates", [])
     if cands:
@@ -56,15 +57,14 @@ def format_report(report: dict) -> str:
 
     out.append("")
     out.append("-" * 78)
-    out.append("PER-WINDOW DETAIL")
+    out.append("PER-CLUSTER DETAIL")
 
     total = report.get("total_speech_sec") or 1.0
     for c in report.get("clusters", []):
         scores = c.get("scores", [])
         share  = (c["duration_sec"] / total * 100) if total else 0
         out.append("")
-        out.append(f"[w{c.get('window', 0)}] {c['cluster']}   "
-                   f"segments={c['segment_count']}   "
+        out.append(f"{c['cluster']}   segments={c['segment_count']}   "
                    f"duration={c['duration_sec']:.1f}s ({share:.0f}% of speech)")
         out.append(f"   embedded from {c['segments_used']} segment(s), "
                    f"{c['seconds_used']:.1f}s")
