@@ -188,8 +188,14 @@ async def enroll(name: str = Form(...), audio: UploadFile = File(...)):
 
 @app.get("/speakers")
 async def list_speakers():
-    """List all enrolled speakers."""
-    return {"speakers": _store.list_speakers()}
+    """List all enrolled speakers.
+
+    `details` carries the same names with the date each embedding was written,
+    so a stale voice profile is visible without going to the filesystem.
+    `speakers` stays a plain list of names for existing callers.
+    """
+    details = _store.list_details()
+    return {"speakers": [d["name"] for d in details], "details": details}
 
 
 @app.post("/speakers/{name}/rename")

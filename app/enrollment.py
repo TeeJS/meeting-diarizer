@@ -4,6 +4,7 @@ Speaker enrollment store — saves and loads speaker voice embeddings as .npy fi
 
 import logging
 import numpy as np
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
@@ -54,6 +55,25 @@ class EnrollmentStore:
 
     def list_speakers(self) -> List[str]:
         return sorted(p.stem for p in self._dir.glob("*.npy"))
+
+    def list_details(self) -> List[Dict]:
+        """Speakers with the date their embedding was written.
+
+        The file's mtime is the enrollment date -- nothing separate is stored.
+        A rename keeps the inode, so renaming a profile preserves the date it
+        was originally enrolled, which is the behaviour worth having: the date
+        answers "how stale is this voice profile", not "when was this label
+        last edited". Restoring the directory from a backup would reset it.
+        """
+        out = []
+        for p in sorted(self._dir.glob("*.npy"), key=lambda q: q.stem):
+            try:
+                enrolled_at = datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)
+                stamp = enrolled_at.isoformat()
+            except OSError:
+                stamp = None
+            out.append({"name": p.stem, "enrolled_at": stamp})
+        return out
 
     def all_embeddings(self) -> Dict[str, np.ndarray]:
         return {p.stem: np.load(p) for p in self._dir.glob("*.npy")}

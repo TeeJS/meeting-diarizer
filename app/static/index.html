@@ -32,9 +32,15 @@
   .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em;
              color: var(--muted); margin: 0 0 12px; }
   table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 0 6px 6px; font-size: 12px; font-weight: 600;
+       text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+       border-bottom: 1px solid var(--line); }
+  th:last-child { width: 1%; }
   td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   tr:last-child td { border-bottom: 0; }
   .name { font-weight: 600; }
+  .when { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .when .age { opacity: .75; }
   .actions { text-align: right; white-space: nowrap; }
   button, input[type=text], input[type=file] {
     font: inherit; border-radius: 7px; border: 1px solid var(--line);
@@ -66,7 +72,10 @@
 
   <div class="card">
     <h2>Enrolled <span class="count" id="count">…</span></h2>
-    <table><tbody id="list"></tbody></table>
+    <table>
+      <thead><tr><th>Name</th><th>Enrolled</th><th></th></tr></thead>
+      <tbody id="list"></tbody>
+    </table>
     <div class="msg" id="listMsg"></div>
   </div>
 
@@ -103,29 +112,60 @@ async function api(path, opts) {
   return body;
 }
 
+function formatWhen(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const date = d.toLocaleDateString(undefined,
+    { year: "numeric", month: "short", day: "numeric" });
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  let age;
+  if (days <= 0) age = "today";
+  else if (days === 1) age = "yesterday";
+  else if (days < 60) age = days + " days ago";
+  else if (days < 730) age = Math.round(days / 30.44) + " months ago";
+  else age = (days / 365.25).toFixed(1) + " years ago";
+  return { date, age };
+}
+
 async function load() {
   const tbody = $("list");
   try {
     const data = await api("../speakers");
-    const names = data.speakers || [];
-    $("count").textContent = names.length;
+    // details carries enrollment dates; fall back to bare names if absent
+    const rows = data.details
+      || (data.speakers || []).map(n => ({ name: n, enrolled_at: null }));
+    $("count").textContent = rows.length;
     tbody.innerHTML = "";
-    if (!names.length) {
+    if (!rows.length) {
       tbody.innerHTML = '<tr><td class="empty">Nobody enrolled yet.</td></tr>';
       return;
     }
-    for (const name of names) tbody.appendChild(rowFor(name));
+    for (const r of rows) tbody.appendChild(rowFor(r.name, r.enrolled_at));
   } catch (e) {
     say($("listMsg"), "Could not load speakers: " + e.message, false);
   }
 }
 
-function rowFor(name) {
+function rowFor(name, enrolledAt) {
   const tr = document.createElement("tr");
 
   const tdName = document.createElement("td");
   tdName.className = "name";
   tdName.textContent = name;
+
+  const tdWhen = document.createElement("td");
+  tdWhen.className = "when";
+  const when = formatWhen(enrolledAt);
+  if (when) {
+    tdWhen.textContent = when.date + " ";
+    const age = document.createElement("span");
+    age.className = "age";
+    age.textContent = "(" + when.age + ")";
+    tdWhen.appendChild(age);
+  } else {
+    tdWhen.textContent = "—";
+  }
 
   const tdAct = document.createElement("td");
   tdAct.className = "actions";
@@ -151,7 +191,7 @@ function rowFor(name) {
   };
 
   tdAct.append(renameBtn, " ", delBtn);
-  tr.append(tdName, tdAct);
+  tr.append(tdName, tdWhen, tdAct);
   return tr;
 }
 
