@@ -36,6 +36,11 @@
        text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
        border-bottom: 1px solid var(--line); }
   th:last-child { width: 1%; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--ink); }
+  th.sortable .caret { opacity: 0; margin-left: 4px; }
+  th.sortable.active { color: var(--ink); }
+  th.sortable.active .caret { opacity: 1; }
   td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   tr:last-child td { border-bottom: 0; }
   .name { font-weight: 600; }
@@ -73,7 +78,11 @@
   <div class="card">
     <h2>Enrolled <span class="count" id="count">…</span></h2>
     <table>
-      <thead><tr><th>Name</th><th>Enrolled</th><th></th></tr></thead>
+      <thead><tr>
+        <th class="sortable" id="thName">Name<span class="caret"></span></th>
+        <th class="sortable" id="thWhen">Enrolled<span class="caret"></span></th>
+        <th></th>
+      </tr></thead>
       <tbody id="list"></tbody>
     </table>
     <div class="msg" id="listMsg"></div>
@@ -128,20 +137,61 @@ function formatWhen(iso) {
   return { date, age };
 }
 
-async function load() {
+let speakers = [];
+// date descending puts the freshest first; name ascending is the calmer default
+let sort = { key: "name", dir: 1 };
+
+function sorted() {
+  const { key, dir } = sort;
+  return speakers.slice().sort((a, b) => {
+    if (key === "date") {
+      // never-dated rows sit at the bottom whichever way the column is sorted
+      if (!a.enrolled_at && !b.enrolled_at) return a.name.localeCompare(b.name);
+      if (!a.enrolled_at) return 1;
+      if (!b.enrolled_at) return -1;
+      const d = new Date(a.enrolled_at) - new Date(b.enrolled_at);
+      return d ? d * dir : a.name.localeCompare(b.name);
+    }
+    return a.name.localeCompare(b.name) * dir;
+  });
+}
+
+function render() {
   const tbody = $("list");
+  $("count").textContent = speakers.length;
+  tbody.innerHTML = "";
+  if (!speakers.length) {
+    tbody.innerHTML = '<tr><td class="empty" colspan="3">Nobody enrolled yet.</td></tr>';
+    return;
+  }
+  for (const r of sorted()) tbody.appendChild(rowFor(r.name, r.enrolled_at));
+
+  for (const [id, key] of [["thName", "name"], ["thWhen", "date"]]) {
+    const th = $(id);
+    const on = sort.key === key;
+    th.classList.toggle("active", on);
+    th.querySelector(".caret").textContent = on ? (sort.dir === 1 ? "▲" : "▼") : "";
+  }
+}
+
+function sortBy(key) {
+  // re-clicking a column flips it; a new column starts ascending, except dates,
+  // which are far more useful newest-first
+  if (sort.key === key) sort.dir = -sort.dir;
+  else sort = { key, dir: key === "date" ? -1 : 1 };
+  render();
+}
+
+$("thName").onclick = () => sortBy("name");
+$("thWhen").onclick = () => sortBy("date");
+
+async function load() {
   try {
     const data = await api("../speakers");
     // details carries enrollment dates; fall back to bare names if absent
-    const rows = data.details
+    speakers = data.details
       || (data.speakers || []).map(n => ({ name: n, enrolled_at: null }));
-    $("count").textContent = rows.length;
-    tbody.innerHTML = "";
-    if (!rows.length) {
-      tbody.innerHTML = '<tr><td class="empty">Nobody enrolled yet.</td></tr>';
-      return;
-    }
-    for (const r of rows) tbody.appendChild(rowFor(r.name, r.enrolled_at));
+    render();
   } catch (e) {
     say($("listMsg"), "Could not load speakers: " + e.message, false);
   }
