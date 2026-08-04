@@ -46,7 +46,12 @@ MIN_SEGMENT_SEC    = 0.5    # shorter than this does not embed reliably
 
 # Reported in every speaker report so a threshold can be tuned from real runs
 # without re-processing audio (similarity scores do not depend on it).
-THRESHOLD_SWEEP    = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60)
+#
+# Runs to 0.95: the operating threshold is now 0.70-0.75, and a sweep that
+# stops below the value in use cannot answer whether it should move up. Extra
+# rows cost nothing -- each is a comparison against scores already computed.
+THRESHOLD_SWEEP    = (0.30, 0.40, 0.50, 0.55, 0.60, 0.65,
+                      0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
 
 AMBIGUOUS_MARGIN   = 0.05   # best-vs-second gap below which a match is a coin flip
 
