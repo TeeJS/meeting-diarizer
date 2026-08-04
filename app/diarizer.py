@@ -135,6 +135,46 @@ def _default_label(pyannote_label: str, index_map: dict) -> str:
     return f"Speaker {_LABELS[idx]}" if idx < len(_LABELS) else pyannote_label
 
 
+def _fill_unknown_words(words: List[Dict]) -> int:
+    """Give unattributed words to the speaker talking on both sides of them.
+
+    A word is assigned to a speaker only if its midpoint lands inside one of
+    pyannote's turns. Those turns have slivers of a gap at their edges that
+    Whisper's word timings do not respect, so ordinary words fall through and
+    become "Unknown" -- 588 of 1195 segments on one real meeting, mostly single
+    words in mid-sentence.
+
+    They are not pauses in the conversation. The median gap between an
+    unattributed word and the speech before it is 0.00s, and 96% of them have
+    the same speaker on either side: somebody talking before and after with no
+    break said the word in between. Those are filled here.
+
+    Runs sitting at a genuine speaker change are left alone. Deciding whether a
+    word at a handover belongs to the speaker finishing or the one starting is
+    a real question, and "Unknown" is the honest answer -- it also marks the
+    spot, which is worth more once the 96% of noise around it is gone.
+
+    Returns how many words were filled, for the log.
+    """
+    filled = 0
+    i = 0
+    while i < len(words):
+        if words[i].get("speaker") != "Unknown":
+            i += 1
+            continue
+        j = i
+        while j < len(words) and words[j].get("speaker") == "Unknown":
+            j += 1
+        before = words[i - 1].get("speaker") if i > 0 else None
+        after  = words[j].get("speaker") if j < len(words) else None
+        if before is not None and before == after:
+            for k in range(i, j):
+                words[k]["speaker"] = before
+                filled += 1
+        i = j
+    return filled
+
+
 def _words_to_segments(words: List[Dict], label_map: Dict[str, str]) -> List[Dict]:
     """Group consecutive same-speaker words into text segments."""
     if not words:
@@ -555,6 +595,14 @@ class Diarizer:
                 if start <= mid <= end:
                     w["speaker"] = spk
                     break
+
+        unattributed = sum(1 for w in words if w["speaker"] == "Unknown")
+        filled = _fill_unknown_words(words)
+        if unattributed:
+            log.info("Word attribution: %d of %d words fell between turns; "
+                     "%d filled from the surrounding speaker, %d left at a "
+                     "speaker change", unattributed, len(words), filled,
+                     unattributed - filled)
 
         report = self._build_report(clusters, threshold, attendees_set)
         return _words_to_segments(words, label_map), report
