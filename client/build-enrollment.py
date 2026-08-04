@@ -43,7 +43,21 @@ INSET = 0.10          # trimmed from each end of a span, so an adjacent
                       # speaker's first syllable cannot bleed in
 MIN_SPAN = 1.0        # spans shorter than this are not worth the seams
 MIN_TOTAL = 45.0      # refuse to enroll from less audio than this
-VERIFY_SHARE = 90.0   # the extract must be this % one speaker to pass
+
+# Per-clip verification. Each selected clip is identified on its own and has to
+# come back as the target; clips that do not are dropped.
+#
+# The earlier check ran the finished concatenation back through the diarizer and
+# looked at cluster shares. That is circular: the same clustering that decided
+# which segments belonged to this speaker gets to re-judge its own work, so a
+# cluster that had merged two people reports one clean speaker on the way back
+# out. It rated a sample 98.4% pure that turned out to be roughly half somebody
+# else, and passed two others whose interjections were obvious by ear.
+#
+# Identifying each clip separately removes the clustering step, so a clip
+# belonging to another person is judged on its own merits and shows up.
+CLIP_MIN_SCORE = 0.40   # a clip scoring below this for anyone is inconclusive
+CLIP_MAX_REJECT_PCT = 15.0   # give up if this much of the audio is rejected
 
 
 def post(path, fields, files=None):
@@ -66,6 +80,70 @@ def post(path, fields, files=None):
         method="POST")
     with urllib.request.urlopen(req, timeout=3600) as r:
         return json.loads(r.read())
+
+
+def judge_clip(src, a, b, target, threshold, workdir, tag):
+    """Identify one clip on its own. Returns (ok, note, score).
+
+    Judged in isolation, so there is no clustering step that could absorb a
+    second voice into the target's cluster and hide it.
+    """
+    clip = os.path.join(workdir, f"{tag}.wav")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-ss", f"{a:.3f}", "-to", f"{b:.3f}",
+         "-i", src, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", clip],
+        check=True)
+    try:
+        rep = post("/identify", {"threshold": threshold}, {"audio": clip})
+    except Exception as e:
+        return False, f"error: {e}", 0.0
+    finally:
+        if os.path.exists(clip):
+            os.remove(clip)
+
+    clusters = rep.get("clusters") or []
+    if not clusters:
+        return False, "no speech", 0.0
+    if len(clusters) > 1:
+        # two voices in one clip split into two clusters even at this length
+        return False, f"{len(clusters)} voices", 0.0
+    scores = clusters[0].get("scores") or []
+    if not scores:
+        return False, "no score", 0.0
+
+    top = scores[0]
+    if top["name"] != target:
+        return False, f"sounds like {top['name']}", top["score"]
+    if top["score"] < CLIP_MIN_SCORE:
+        return False, "too weak to confirm", top["score"]
+    return True, "", top["score"]
+
+
+def select_verified(pool, target, threshold, want, workdir):
+    """Walk the pooled spans longest-first, verifying each before accepting it,
+    until `want` seconds have been gathered.
+
+    Screening as we go means a rejected clip is replaced by the next-longest
+    candidate rather than simply lost, so contamination costs quality only if
+    it runs out the supply.
+    """
+    kept, rejected, scores, acc = [], [], [], 0.0
+    for i, (src, a, b) in enumerate(pool, 1):
+        if acc >= want:
+            break
+        ok, note, score = judge_clip(src, a, b, target, threshold, workdir,
+                                     f"chk{i:03d}")
+        if ok:
+            kept.append((src, a, b))
+            scores.append(score)
+            acc += b - a
+            print(f"    {b - a:>5.1f}s  ok    {score:.3f}   "
+                  f"[{acc:.0f}s of {want:.0f}s]")
+        else:
+            rejected.append((b - a, note, score))
+            print(f"    {b - a:>5.1f}s  DROP  {note}"
+                  + (f" {score:.3f}" if score else ""))
+    return kept, rejected, scores, acc
 
 
 def extract(spans, dest):
@@ -146,59 +224,66 @@ def main():
         print(f"\n{target!r} was not identified in any source given.")
         sys.exit(2)
 
-    # longest first across every source, so the extra seconds come from the
-    # best available audio rather than padding one meeting with its leftovers
+    # longest first across every source, so the best audio is tried first and
+    # anything rejected is replaced by the next-best rather than simply lost
     pool.sort(key=lambda s: s[2] - s[1], reverse=True)
-    chosen, acc = [], 0.0
-    for s in pool:
-        if acc >= max_seconds:
-            break
-        chosen.append(s)
-        acc += s[2] - s[1]
+
+    print(f"\nVerifying each clip on its own ({len(pool)} candidate span(s)) ...")
+    with tempfile.TemporaryDirectory() as work:
+        chosen, rejected, clip_scores, acc = select_verified(
+            pool, target, threshold, max_seconds, work)
+
+    dropped = sum(d for d, _, _ in rejected)
+    total_seen = acc + dropped
+    pct = (dropped / total_seen * 100) if total_seen else 0.0
+    print(f"\nkept {len(chosen)} clip(s), {acc:.1f}s; "
+          f"dropped {len(rejected)}, {dropped:.1f}s ({pct:.0f}% of what was checked)")
+    if rejected:
+        reasons = {}
+        for d, note, _ in rejected:
+            reasons[note] = reasons.get(note, 0) + 1
+        for note, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"    {n:>2}x  {note}")
+
+    if not chosen:
+        print(f"\nNothing survived verification -- this cluster is not {target}.")
+        sys.exit(4)
+    if acc < MIN_TOTAL:
+        print(f"\nOnly {acc:.1f}s verified as {target} -- under the "
+              f"{MIN_TOTAL:.0f}s minimum. Try a meeting where they speak more.")
+        sys.exit(3)
+    # Two different failures hide behind a rejection, and only one is alarming.
+    # A clip dropped for holding two voices is ordinary crosstalk -- longer
+    # spans catch more of it, so the best material fails most often, and
+    # dropping it is the tool working. A clip that identifies as somebody else
+    # means the source cluster itself is mixed, which the kept clips may share.
+    wrong = sum(d for d, note, _ in rejected if note.startswith("sounds like"))
+    wrong_pct = (wrong / total_seen * 100) if total_seen else 0.0
+    if wrong_pct > CLIP_MAX_REJECT_PCT:
+        print(f"\n{wrong_pct:.0f}% of the checked audio identified as somebody "
+              f"else. The source cluster is mixed, and the kept clips may be "
+              f"too -- a clip has to be wrong enough to fail on its own. "
+              f"Treat this sample with suspicion.")
+
+    kept_scores = clip_scores
+    if kept_scores:
+        lo, hi = min(kept_scores), max(kept_scores)
+        print(f"\nkept clips scored {lo:.2f} to {hi:.2f} for {target}")
+        if hi < 0.70:
+            print(f"  every clip is weak. Either the clips are too short to "
+                  f"judge, or this cluster is not reliably {target}. Listen "
+                  f"before enrolling.")
+
     # play back grouped by source, chronological within each
     chosen.sort(key=lambda s: (sources.index(s[0]), s[1]))
     used = [s for s in sources if any(c[0] == s for c in chosen)]
-
-    print(f"\nselected {len(chosen)} span(s) totalling {acc:.1f}s "
-          f"from {len(used)} source(s)")
-
-    if acc < MIN_TOTAL:
-        print(f"\nOnly {acc:.1f}s available -- under the {MIN_TOTAL:.0f}s minimum.")
-        sys.exit(3)
 
     stamp = "+".join(sorted({os.path.basename(s)[:10] for s in used}))
     slug = target.replace(" ", "-").replace(",", "")
     os.makedirs(outdir, exist_ok=True)
     dest = os.path.join(outdir, f"{slug}_voice-enrollment_{stamp}.wav")
     extract(chosen, dest)
-    print(f"  wrote {dest}")
-
-    def reject(msg, code):
-        """A sample that fails verification is deleted rather than left behind.
-        A mixed clip in the enrollment folder is worse than no clip -- it looks
-        like a usable asset and would quietly poison whoever picks it up."""
-        os.remove(dest)
-        print(f"\n{msg}\nRemoved {os.path.basename(dest)}.")
-        sys.exit(code)
-
-    print("\nVerifying the extract is one speaker ...")
-    check = post("/identify", {"threshold": threshold}, {"audio": dest})
-    speakers = check.get("speakers", [])
-    if not speakers:
-        reject("No speech detected in the extract.", 4)
-    top = speakers[0]
-    print(f"  {len(speakers)} cluster(s); dominant {top['label']} "
-          f"at {top['speech_pct']}% of speech")
-    for s in speakers[1:]:
-        print(f"    also {s['label']} {s['speech_pct']}%")
-
-    if top["speech_pct"] < VERIFY_SHARE:
-        reject(f"Extract is only {top['speech_pct']}% one speaker "
-               f"(want >= {VERIFY_SHARE}%) -- the sample is mixed.", 5)
-    if top["label"] != target:
-        reject(f"Extract identifies as {top['label']!r}, not {target!r}.", 6)
-
-    print("  clean")
+    print(f"\nwrote {dest} ({acc:.1f}s from {len(used)} source(s))")
     if not do_enroll:
         print(f"\nNot enrolled (no --enroll). Sample kept at:\n  {dest}")
         return
