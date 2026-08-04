@@ -141,7 +141,7 @@ def _fill_unknown_words(words: List[Dict]) -> int:
     A word is assigned to a speaker only if its midpoint lands inside one of
     pyannote's turns. Those turns have slivers of a gap at their edges that
     Whisper's word timings do not respect, so ordinary words fall through and
-    become "Unknown" -- 588 of 1195 segments on one real meeting, mostly single
+    become "UNKNOWN" -- 588 of 1195 segments on one real meeting, mostly single
     words in mid-sentence.
 
     They are not pauses in the conversation. The median gap between an
@@ -151,7 +151,7 @@ def _fill_unknown_words(words: List[Dict]) -> int:
 
     Runs sitting at a genuine speaker change are left alone. Deciding whether a
     word at a handover belongs to the speaker finishing or the one starting is
-    a real question, and "Unknown" is the honest answer -- it also marks the
+    a real question, and "UNKNOWN" is the honest answer -- it also marks the
     spot, which is worth more once the 96% of noise around it is gone.
 
     Returns how many words were filled, for the log.
@@ -159,11 +159,11 @@ def _fill_unknown_words(words: List[Dict]) -> int:
     filled = 0
     i = 0
     while i < len(words):
-        if words[i].get("speaker") != "Unknown":
+        if words[i].get("speaker") != "UNKNOWN":
             i += 1
             continue
         j = i
-        while j < len(words) and words[j].get("speaker") == "Unknown":
+        while j < len(words) and words[j].get("speaker") == "UNKNOWN":
             j += 1
         before = words[i - 1].get("speaker") if i > 0 else None
         after  = words[j].get("speaker") if j < len(words) else None
@@ -181,13 +181,13 @@ def _words_to_segments(words: List[Dict], label_map: Dict[str, str]) -> List[Dic
         return []
 
     segments = []
-    cur_spk   = words[0].get("speaker", "Unknown")
+    cur_spk   = words[0].get("speaker", "UNKNOWN")
     cur_words = [words[0]["word"]]
     cur_start = words[0]["start"]
     cur_end   = words[0]["end"]
 
     for w in words[1:]:
-        spk = w.get("speaker", "Unknown")
+        spk = w.get("speaker", "UNKNOWN")
         if spk == cur_spk:
             cur_words.append(w["word"])
             cur_end = w["end"]
@@ -590,13 +590,13 @@ class Diarizer:
         # Assign each word to a speaker by the midpoint of its timing
         for w in words:
             mid = (w["start"] + w["end"]) / 2
-            w["speaker"] = "Unknown"
+            w["speaker"] = "UNKNOWN"
             for start, end, spk in timeline:
                 if start <= mid <= end:
                     w["speaker"] = spk
                     break
 
-        unattributed = sum(1 for w in words if w["speaker"] == "Unknown")
+        unattributed = sum(1 for w in words if w["speaker"] == "UNKNOWN")
         filled = _fill_unknown_words(words)
         if unattributed:
             log.info("Word attribution: %d of %d words fell between turns; "
