@@ -17,9 +17,8 @@ import urllib.error
 
 DIARIZER_HOST      = os.environ.get("DIARIZER_HOST", "192.168.1.25")
 DIARIZER_PORT      = int(os.environ.get("DIARIZER_PORT", "10301"))
-# Matches the service default. This was 0.75, which sits above the score of a
-# correct match on clean audio -- every genuine identification failed.
-DEFAULT_THRESHOLD  = float(os.environ.get("DIARIZER_THRESHOLD", "0.45"))
+# Matches the service default.
+DEFAULT_THRESHOLD  = float(os.environ.get("DIARIZER_THRESHOLD", "0.70"))
 
 
 def format_report(report: dict) -> str:

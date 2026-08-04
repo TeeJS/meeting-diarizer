@@ -17,11 +17,17 @@ from .enrollment import EnrollmentStore
 
 log = logging.getLogger(__name__)
 
-# Genuine matches measured across five runs bottomed out at 0.506; confirmed
-# strangers topped out at 0.311 and blended/cross-speaker clusters at 0.362.
-# 0.45 sits in the gap. At the previous 0.35 an unenrolled attendee scored
-# 0.362 against the nearest enrolled voice and was published under their name.
-SIMILARITY_THRESHOLD = 0.45
+# Raised 0.45 -> 0.70 once every profile was rebuilt from current-hardware
+# audio. At 0.45 the weakest enrolled voices scored 0.50-0.75, close enough to
+# the 0.46 impostor ceiling that no cutoff separated them; an unenrolled
+# attendee scoring 0.36 against a colleague had his speech published under that
+# colleague's name. Rebuilt profiles measure 0.76-0.99, so the gap is now wide
+# and the cutoff can sit well clear of anyone who is not enrolled.
+#
+# Headroom is thinnest for Jason Wronski at 0.7612 and Carl Tanner at 0.7905 --
+# and scores move by a few hundredths between meetings, so those two are the
+# ones to watch if someone starts coming back unnamed.
+SIMILARITY_THRESHOLD = 0.70
 ATTENDEE_OFFSET      = 0.15  # subtracted from similarity scores of non-attendees
 EMBEDDING_MODEL      = "pyannote/wespeaker-voxceleb-resnet34-LM"
 _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
