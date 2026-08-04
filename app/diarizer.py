@@ -28,7 +28,14 @@ _LABELS              = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # Segment selection for cluster embeddings. These are chosen longest-first --
 # see _cluster_embedding() for why the order matters more than the count.
-MAX_EMBED_SEGMENTS = 20
+#
+# Raised from 20 to 30. The cap binds hardest on people who speak in short
+# turns: one speaker with 222s of speech across turns averaging 3.9s yielded
+# only 77.7s of usable audio for a re-enrollment, because 20 spans was all the
+# report would surface. It also means the cluster embedding itself averages
+# over more of the speaker. Cost is 50% more embedding inferences per cluster,
+# which is the smaller half of the work next to diarization itself.
+MAX_EMBED_SEGMENTS = 30
 MIN_SEGMENT_SEC    = 0.5    # shorter than this does not embed reliably
 
 # Reported in every speaker report so a threshold can be tuned from real runs
