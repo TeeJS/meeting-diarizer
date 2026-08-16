@@ -76,6 +76,8 @@ async def transcribe(
     audio: UploadFile = File(...),
     threshold: float = Form(0.70),
     attendees: Optional[str] = Form(None),
+    me_name: Optional[str] = Form(None),
+    me_channel: Optional[str] = Form(None),
 ):
     """
     Transcribe an audio file with speaker diarization.
@@ -104,6 +106,16 @@ async def transcribe(
                                           biasing the diarizer toward in-meeting
                                           candidates. Names must match enrolled
                                           names exactly (no fuzzy matching).
+      - me_name (str)                   — channel-guided identification. On a
+                                          multi-channel upload, names the
+                                          speaker isolated on me_channel from
+                                          channel energy alone — ground truth,
+                                          bypassing voice matching for that
+                                          speaker entirely. Silently inert (no
+                                          error) on a mono upload. Wire-
+                                          compatible with tts-stt-windows.
+      - me_channel (str, default "left")— which channel is the isolated mic:
+                                          "left"/"0" or "right"/"1".
     """
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -115,11 +127,12 @@ async def transcribe(
         attendee_list = [a.strip() for a in attendees.split(",") if a.strip()]
 
     try:
-        log.info("Transcribe request — threshold=%.2f, attendees=%s",
-                 threshold, attendee_list if attendee_list else "(none)")
+        log.info("Transcribe request — threshold=%.2f, attendees=%s, me_name=%s",
+                 threshold, attendee_list if attendee_list else "(none)", me_name or "(none)")
         words = _transcriber.transcribe(tmp_path)
         segments, report = _diarizer.diarize(tmp_path, words, threshold=threshold,
-                                             attendees=attendee_list)
+                                             attendees=attendee_list,
+                                             me_name=me_name, me_channel=me_channel)
         # speaker_report first so it reads at the top of a saved JSON file
         return JSONResponse({"speaker_report": report, "segments": segments})
     except Exception as e:
@@ -134,6 +147,8 @@ async def identify(
     audio: UploadFile = File(...),
     threshold: float = Form(0.70),
     attendees: Optional[str] = Form(None),
+    me_name: Optional[str] = Form(None),
+    me_channel: Optional[str] = Form(None),
 ):
     """
     Diagnostic: run diarization + enrolled-speaker identification only — no
@@ -141,7 +156,8 @@ async def identify(
     for verifying an enrollment or tuning threshold/attendees without paying
     for transcription.
 
-    Optional form fields: same as /transcribe — threshold, attendees.
+    Optional form fields: same as /transcribe — threshold, attendees, me_name,
+    me_channel.
     """
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -153,10 +169,11 @@ async def identify(
         attendee_list = [a.strip() for a in attendees.split(",") if a.strip()]
 
     try:
-        log.info("Identify request — threshold=%.2f, attendees=%s",
-                 threshold, attendee_list if attendee_list else "(none)")
+        log.info("Identify request — threshold=%.2f, attendees=%s, me_name=%s",
+                 threshold, attendee_list if attendee_list else "(none)", me_name or "(none)")
         report = _diarizer.identify_speakers(tmp_path, threshold=threshold,
-                                             attendees=attendee_list)
+                                             attendees=attendee_list,
+                                             me_name=me_name, me_channel=me_channel)
         return JSONResponse(report)
     except Exception as e:
         log.exception("Identification failed")

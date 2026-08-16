@@ -59,6 +59,20 @@ AMBIGUOUS_MARGIN   = 0.05   # best-vs-second gap below which a match is a coin f
 # enrolling -- they are almost certainly a colleague who will recur.
 ENROLL_CANDIDATE_PCT = 5.0
 
+# When a caller marks one channel as an isolated microphone (open-quake records
+# the user's mic on the left channel, everyone else's loopback on the right), a
+# cluster whose speech energy on the mic channel is at least this many times its
+# energy on the other channel is that user -- ground truth, no cosine threshold.
+# During the user's own speech the mic channel dominates hugely; during everyone
+# else's it's near silent (only bleed), so the two populations separate with
+# wide margin and 3x is safely clear of both.
+#
+# Ported to tts-stt-windows/internal/diarize/diarize.go as ChannelMeRatio --
+# keep the two in sync, and keep the me_name/me_channel wire contract (form
+# field names, left=0/right=1 default) identical so either service can be
+# swapped in with no client-side change.
+CHANNEL_ME_RATIO = 3.0
+
 
 PYANNOTE_SR = 16000  # sample rate pyannote models expect
 
@@ -100,6 +114,79 @@ def _crop_audio(audio: dict, start: float, end: float) -> dict:
     s  = int(start * sr)
     e  = int(end   * sr)
     return {"waveform": audio["waveform"][:, s:e], "sample_rate": sr}
+
+
+def _probe_channel_count(path: str) -> int:
+    """ffprobe the input's channel count. Only called when me_name is present --
+    everything else in the pipeline works from the mono downmix and never needs
+    this."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=channels", "-of", "csv=p=0", path],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        return int(out) if out else 1
+    except (subprocess.CalledProcessError, ValueError):
+        return 1
+
+
+def _load_channels(path: str, n_channels: int) -> List[np.ndarray]:
+    """Decode to n_channels separate 16 kHz signals, for channel-guided
+    identification. Kept apart from _load_audio() because every other caller
+    wants the mono downmix and this decode is skippable when they don't."""
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path,
+         "-ar", str(PYANNOTE_SR), "-f", "f32le", "-"],
+        check=True, capture_output=True,
+    ).stdout
+    interleaved = np.frombuffer(out, dtype=np.float32).copy()
+    usable = len(interleaved) - (len(interleaved) % n_channels)
+    frames = interleaved[:usable].reshape(-1, n_channels)
+    return [frames[:, c] for c in range(n_channels)]
+
+
+class MeHint:
+    """Marks one channel of the recording as a known speaker's isolated
+    microphone, letting the pipeline name that speaker's cluster from channel
+    energy instead of voice matching. Port of MeHint in
+    tts-stt-windows/internal/diarize/pipeline.go -- Name is the speaker
+    (resolved to their enrolled display name when it matches an enrollment via
+    _resolve_me_name); Channel is the mic channel's index; Signals are the
+    per-channel 16 kHz signals from _load_channels(). Inert (active() False)
+    on a mono upload or an empty name.
+    """
+    def __init__(self, name: str, channel: int, signals: List[np.ndarray]):
+        self.name     = name
+        self.channel  = channel
+        self.signals  = signals
+
+    def active(self) -> bool:
+        return bool(self.name.strip()) and len(self.signals) >= 2 \
+            and 0 <= self.channel < len(self.signals)
+
+
+def _channel_energy(signal: np.ndarray, segs: List[Segment]) -> float:
+    """Sum the squared sample energy of a signal over a set of turns."""
+    e = 0.0
+    n = len(signal)
+    for seg in segs:
+        lo = max(0, int(seg.start * PYANNOTE_SR))
+        hi = min(n, int(seg.end   * PYANNOTE_SR))
+        if hi > lo:
+            e += float(np.sum(signal[lo:hi].astype(np.float64) ** 2))
+    return e
+
+
+def _is_me(hint: MeHint, segs: List[Segment]) -> bool:
+    """Whether a cluster's speech is dominated by the mic channel -- i.e. it is
+    the hinted user talking, not their mic picking up someone else's bleed."""
+    if not hint.active():
+        return False
+    me = _channel_energy(hint.signals[hint.channel], segs)
+    other = sum(_channel_energy(sig, segs)
+                for i, sig in enumerate(hint.signals) if i != hint.channel)
+    return me > 1e-6 and me >= other * CHANNEL_ME_RATIO
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -416,8 +503,34 @@ class Diarizer:
                  len(attendees_set), sorted(attendees_set))
         return attendees_set
 
+    def _resolve_me_name(self, name: str) -> str:
+        """Map a hinted name to its enrolled display form when one matches (via
+        normalize_name), so the label agrees with the speaker's profile;
+        otherwise the name is used verbatim -- the channel is proof they
+        spoke, enrolled or not."""
+        by_norm = {normalize_name(e): e for e in self._store.list_speakers()}
+        return by_norm.get(normalize_name(name), name)
+
+    def _resolve_me_hint(self, audio_path: str, me_name: Optional[str],
+                         me_channel: Optional[str]) -> Optional[MeHint]:
+        """Build a MeHint from the raw me_name/me_channel form fields, decoding
+        per-channel audio only if a name was actually given. Silently inert
+        (returns None) on a mono upload -- the caller gets normal voice
+        matching, no error."""
+        if not me_name or not me_name.strip():
+            return None
+        n_channels = _probe_channel_count(audio_path)
+        if n_channels < 2:
+            log.info("me_name=%r given but upload is mono — channel-guided ID "
+                     "inert, falling back to voice matching", me_name)
+            return None
+        ch = 1 if (me_channel or "").strip().lower() in ("right", "1") else 0
+        signals = _load_channels(audio_path, n_channels)
+        return MeHint(name=me_name.strip(), channel=ch, signals=signals)
+
     def _analyze_clusters(self, audio: dict, timeline: List[tuple], threshold: float,
-                          attendees_set: Optional[set]) -> List[Dict]:
+                          attendees_set: Optional[set],
+                          me_hint: Optional[MeHint] = None) -> List[Dict]:
         """Embed and identify every speaker cluster in the timeline.
 
         Returns one entry per cluster, ordered to match sorted(unique pyannote
@@ -429,6 +542,8 @@ class Diarizer:
         have_enrollments = bool(self._store.list_speakers())
         if not have_enrollments:
             log.warning("No enrolled speakers — clusters will keep generic labels.")
+
+        me_label = self._resolve_me_name(me_hint.name) if me_hint and me_hint.active() else None
 
         clusters = []
         for pyannote_label in unique_spks:
@@ -472,6 +587,15 @@ class Diarizer:
                         entry["margin"]    = margin
                         entry["ambiguous"] = margin < AMBIGUOUS_MARGIN
 
+            # An isolated-mic channel is ground truth: if this cluster's speech
+            # is mic-channel-dominant it IS the hinted user, overriding
+            # whatever voice matching said (the cosine scores above stay in
+            # the report for transparency). Independent of have_enrollments --
+            # the channel is proof on its own.
+            if me_label and _is_me(me_hint, segs):
+                entry["matched"]         = me_label
+                entry["channel_matched"] = True
+
             clusters.append(entry)
 
         return clusters
@@ -487,7 +611,8 @@ class Diarizer:
         ]
 
     def _diarize(self, audio: dict, threshold: float,
-                 attendees_set: Optional[set]) -> Tuple[List[tuple], List[Dict], Dict]:
+                 attendees_set: Optional[set],
+                 me_hint: Optional[MeHint] = None) -> Tuple[List[tuple], List[Dict], Dict]:
         """Diarize the whole recording in one pass and label every cluster.
 
         An earlier version split long recordings into ~10 minute windows and
@@ -507,7 +632,7 @@ class Diarizer:
             log.warning("No speech detected.")
             return [], [], {}
 
-        clusters = self._analyze_clusters(audio, timeline, threshold, attendees_set)
+        clusters = self._analyze_clusters(audio, timeline, threshold, attendees_set, me_hint)
         spks     = sorted(set(t[2] for t in timeline))
 
         # Identified clusters take the speaker's name; the rest are lettered in
@@ -562,30 +687,46 @@ class Diarizer:
         }
 
     def identify_speakers(self, audio_path: str, threshold: float = SIMILARITY_THRESHOLD,
-                           attendees: Optional[List[str]] = None) -> Dict:
+                           attendees: Optional[List[str]] = None,
+                           me_name: Optional[str] = None,
+                           me_channel: Optional[str] = None) -> Dict:
         """
         Run diarization + enrolled-speaker identification only — no transcription.
         For diagnosing enrollment/threshold issues against a sample clip.
 
+        If `me_name` is given and the upload has 2+ channels, the cluster whose
+        speech is dominated by `me_channel` ("left"/"right", default "left") is
+        labeled as `me_name` from channel energy alone, bypassing voice
+        matching entirely for that speaker. See MeHint / _is_me.
+
         Returns the same speaker report that diarize() produces.
         """
         attendees_set  = self._resolve_attendees(attendees)
+        me_hint        = self._resolve_me_hint(audio_path, me_name, me_channel)
         audio          = _load_audio(audio_path)
-        _, clusters, _ = self._diarize(audio, threshold, attendees_set)
+        _, clusters, _ = self._diarize(audio, threshold, attendees_set, me_hint)
         return self._build_report(clusters, threshold, attendees_set)
 
     def diarize(self, audio_path: str, words: List[Dict], threshold: float = SIMILARITY_THRESHOLD,
-                attendees: Optional[List[str]] = None) -> Tuple[List[Dict], Dict]:
+                attendees: Optional[List[str]] = None,
+                me_name: Optional[str] = None,
+                me_channel: Optional[str] = None) -> Tuple[List[Dict], Dict]:
         """
         Run diarization, align with word timestamps, identify speakers,
         and return (segments, speaker_report).
 
         If `attendees` is provided, enrolled speakers not in the list have
         ATTENDEE_OFFSET subtracted from their score during identification.
+
+        If `me_name` is given and the upload has 2+ channels, the cluster whose
+        speech is dominated by `me_channel` ("left"/"right", default "left") is
+        labeled as `me_name` from channel energy alone, bypassing voice
+        matching entirely for that speaker. See MeHint / _is_me.
         """
         attendees_set = self._resolve_attendees(attendees)
+        me_hint       = self._resolve_me_hint(audio_path, me_name, me_channel)
         audio         = _load_audio(audio_path)
-        timeline, clusters, label_map = self._diarize(audio, threshold, attendees_set)
+        timeline, clusters, label_map = self._diarize(audio, threshold, attendees_set, me_hint)
 
         # Assign each word to a speaker by the midpoint of its timing
         for w in words:
